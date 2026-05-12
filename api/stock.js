@@ -122,10 +122,10 @@ async function getQuote(symbol, exchange) {
 
 // ─── B. Historical OHLCV (6 months) ──────────────────────────────────────────
 
-async function getHistorical(symbol, exchange) {
-  const toDate   = new Date();
-  const fromDate = new Date();
-  fromDate.setMonth(fromDate.getMonth() - 6);
+async function getHistorical(symbol, exchange, endDate) {
+  const toDate   = endDate instanceof Date ? new Date(endDate) : new Date();
+  const fromDate = new Date(toDate);
+  fromDate.setFullYear(fromDate.getFullYear() - 1);
 
   const nseDate = d => `${String(d.getDate()).padStart(2,'0')}-${String(d.getMonth()+1).padStart(2,'0')}-${d.getFullYear()}`;
   const bseDate = d => `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;
@@ -213,13 +213,13 @@ function computeIndicators(hist) {
     const prev = hist[hist.length - 2];
     const p = (prev.high + prev.low + prev.close) / 3;
     pivots = {
-      pivot : parseFloat(p.toFixed(2)),
-      r1    : parseFloat(((2 * p) - prev.low).toFixed(2)),
-      r2    : parseFloat((p + (prev.high - prev.low)).toFixed(2)),
-      r3    : parseFloat((prev.high + 2 * (p - prev.low)).toFixed(2)),
-      s1    : parseFloat(((2 * p) - prev.high).toFixed(2)),
-      s2    : parseFloat((p - (prev.high - prev.low)).toFixed(2)),
-      s3    : parseFloat((prev.low - 2 * (prev.high - p)).toFixed(2))
+      p  : parseFloat(p.toFixed(2)),
+      r1 : parseFloat(((2 * p) - prev.low).toFixed(2)),
+      r2 : parseFloat((p + (prev.high - prev.low)).toFixed(2)),
+      r3 : parseFloat((prev.high + 2 * (p - prev.low)).toFixed(2)),
+      s1 : parseFloat(((2 * p) - prev.high).toFixed(2)),
+      s2 : parseFloat((p - (prev.high - prev.low)).toFixed(2)),
+      s3 : parseFloat((prev.low - 2 * (prev.high - p)).toFixed(2))
     };
   }
 
@@ -305,6 +305,12 @@ function detectCandles(hist) {
     // Dark Cloud Cover
     if (isBull(prev) && isBear(curr) && curr.open > prev.high && curr.close < (prev.open + prev.close) / 2)
       matches.push({ pattern: 'darkCloudCover', date, confidence: 0.80 });
+
+    // Marubozu (body fills ≥95 % of range — no/tiny wicks)
+    if (range > 0 && body / range >= 0.95) {
+      if (isBull(curr)) matches.push({ pattern: 'bullishMarubozu', date, confidence: 0.85 });
+      if (isBear(curr)) matches.push({ pattern: 'bearishMarubozu', date, confidence: 0.85 });
+    }
 
     result.last5Days.push(...matches);
     if (i === hist.length - 1) result.mostRecent.push(...matches);
@@ -665,6 +671,63 @@ async function getSector(symbol) {
   }
 }
 
+// ─── Historical Quote Reconstruction (when date param is in the past) ────────
+
+function buildHistoricalQuote(hist, asOfDateStr) {
+  if (!hist || hist.length === 0) return null;
+  // last entry whose date ≤ asOfDateStr
+  const usable = hist.filter(h => h.date <= asOfDateStr);
+  if (usable.length === 0) return null;
+  const target  = usable[usable.length - 1];
+  const prev    = usable.length >= 2 ? usable[usable.length - 2] : null;
+  const prevClose = prev ? prev.close : null;
+  const change    = prevClose != null ? parseFloat((target.close - prevClose).toFixed(2)) : null;
+  const pChange   = prevClose != null && prevClose !== 0
+    ? parseFloat((((target.close - prevClose) / prevClose) * 100).toFixed(2))
+    : null;
+
+  // 52-week extremes from the historical window passed in
+  const week52High = Math.max(...hist.map(h => h.high));
+  const week52Low  = Math.min(...hist.map(h => h.low));
+
+  return {
+    ltp               : target.close,
+    open              : target.open,
+    high              : target.high,
+    low               : target.low,
+    previousClose     : prevClose,
+    change,
+    pChange,
+    lowerCircuit      : null,  // not available for historical dates
+    upperCircuit      : null,
+    totalTradedVolume : target.volume,
+    vwap              : null,
+    bid               : null,
+    ask               : null,
+    week52High,
+    week52Low,
+    faceValue         : null,
+    lastUpdateTime    : target.date
+  };
+}
+
+// ─── Date window filter for news / announcements ──────────────────────────────
+
+function withinDateWindow(items, dateField, endDate, daysBack = 30) {
+  if (!Array.isArray(items)) return [];
+  const end   = new Date(endDate);
+  const start = new Date(endDate);
+  start.setDate(start.getDate() - daysBack);
+
+  return items.filter(item => {
+    const raw = item[dateField];
+    if (!raw) return true;  // keep entries with no date
+    const d = new Date(raw);
+    if (isNaN(d.getTime())) return true;
+    return d >= start && d <= end;
+  });
+}
+
 // ─── Main Handler ─────────────────────────────────────────────────────────────
 
 module.exports = async function handler(req, res) {
@@ -674,11 +737,23 @@ module.exports = async function handler(req, res) {
 
   if (req.method === 'OPTIONS') { res.status(200).end(); return; }
 
-  const { symbol = 'KRITINUT', exchange } = req.query;
+  const { symbol = 'KRITINUT', exchange, date } = req.query;
   const upperSymbol = symbol.toUpperCase();
-  const cacheKey    = `${upperSymbol}_${exchange || 'auto'}`;
 
-  // Serve from cache if fresh
+  // ── Parse & validate `date` parameter ────────────────────────────────────
+  const todayStr = new Date().toISOString().split('T')[0];
+  let requestedDate, requestedDateStr;
+  if (date && /^\d{4}-\d{2}-\d{2}$/.test(date)) {
+    requestedDate    = new Date(date + 'T00:00:00Z');
+    requestedDateStr = date;
+  } else {
+    requestedDate    = new Date();
+    requestedDateStr = todayStr;
+  }
+  const isHistorical = requestedDateStr < todayStr;
+  const cacheKey     = `${upperSymbol}_${exchange || 'auto'}_${requestedDateStr}`;
+
+  // ── Cache ────────────────────────────────────────────────────────────────
   if (cache.has(cacheKey)) {
     const cached = cache.get(cacheKey);
     if (Date.now() - cached.timestamp < CACHE_TTL) {
@@ -690,48 +765,75 @@ module.exports = async function handler(req, res) {
   const errors = {};
 
   try {
-    // 1. Quote (determines which exchange was actually used)
-    const quoteData    = await getQuote(upperSymbol, exchange);
-    const usedExchange = quoteData.source;
+    // ── 1. Historical first (1-year window ending at requestedDate) ───────
+    const historicalAll = await getHistorical(upperSymbol, exchange, requestedDate)
+      .catch(e => { errors.historical = e.message; return []; });
 
-    // 2. All other fetches in parallel
+    // Slice to entries on or before requestedDate (defensive — the API may
+    // already do this, but enforce it ourselves)
+    const historical     = historicalAll.filter(h => h.date <= requestedDateStr);
+    const actualDataDate = historical.length > 0 ? historical[historical.length - 1].date : null;
+
+    // ── 2. Quote ──────────────────────────────────────────────────────────
+    let quote, usedExchange;
+    if (isHistorical) {
+      // Reconstruct quote from historical OHLCV
+      quote        = buildHistoricalQuote(historical, requestedDateStr);
+      usedExchange = exchange || 'nse';
+      if (!quote) errors.quote = 'No historical data found for requested date';
+    } else {
+      try {
+        const quoteData = await getQuote(upperSymbol, exchange);
+        quote           = quoteData.quote;
+        usedExchange    = quoteData.source;
+      } catch (e) {
+        errors.quote = e.message;
+        quote        = null;
+        usedExchange = exchange || 'nse';
+      }
+    }
+
+    // ── 3. Everything else in parallel ────────────────────────────────────
     const [
-      historical, fundamentals, news, announcements,
+      fundamentals, newsAll, announcementsAll,
       delivery, blockDeals, surveillance, fno, sector
     ] = await Promise.all([
-      getHistorical(upperSymbol, usedExchange) .catch(e => { errors.historical    = e.message; return []; }),
-      scrapeFundamentals(upperSymbol)           .catch(e => { errors.fundamentals  = e.message; return null; }),
-      getNews(upperSymbol)                      .catch(e => { errors.news          = e.message; return []; }),
-      getAnnouncements(upperSymbol)             .catch(e => { errors.announcements = e.message; return []; }),
-      getDelivery(upperSymbol)                  .catch(e => { errors.delivery      = e.message; return null; }),
-      getBlockDeals(upperSymbol)                .catch(e => { errors.blockDeals    = e.message; return []; }),
-      getSurveillance(upperSymbol)              .catch(e => { errors.surveillance  = e.message; return null; }),
-      getFNO(upperSymbol)                       .catch(e => { errors.fno           = e.message; return null; }),
-      getSector(upperSymbol)                    .catch(e => { errors.sector        = e.message; return null; })
+      scrapeFundamentals(upperSymbol).catch(e => { errors.fundamentals  = e.message; return null; }),
+      getNews(upperSymbol)           .catch(e => { errors.news          = e.message; return [];   }),
+      getAnnouncements(upperSymbol)  .catch(e => { errors.announcements = e.message; return [];   }),
+      getDelivery(upperSymbol)       .catch(e => { errors.delivery      = e.message; return null; }),
+      getBlockDeals(upperSymbol)     .catch(e => { errors.blockDeals    = e.message; return [];   }),
+      getSurveillance(upperSymbol)   .catch(e => { errors.surveillance  = e.message; return null; }),
+      getFNO(upperSymbol)            .catch(e => { errors.fno           = e.message; return null; }),
+      getSector(upperSymbol)         .catch(e => { errors.sector        = e.message; return null; })
     ]);
 
-    // 3. Compute technicals
-    const indicators     = computeIndicators(historical);
-    const { pivots, ...indicatorsWithoutPivots } = indicators;   // pivot also lives at its own key
-    const candlePatterns = detectCandles(historical);
-    const chartPatterns  = detectChartPatterns(historical);
-    const signals        = computeSignals(historical, indicators);
+    // ── 4. Filter news / announcements by requested-date window ───────────
+    const news          = isHistorical ? withinDateWindow(newsAll,          'published', requestedDate, 30) : newsAll;
+    const announcements = isHistorical ? withinDateWindow(announcementsAll, 'date',      requestedDate, 30) : announcementsAll;
 
+    // ── 5. Technicals — computed strictly on the sliced (≤ requestedDate) data ─
+    const indicators                            = computeIndicators(historical);
+    const { pivots, ...indicatorsWithoutPivots } = indicators;
+    const candlePatterns                        = detectCandles(historical);
+    const chartPatterns                         = detectChartPatterns(historical);
+    const signals                               = computeSignals(historical, indicators);
+
+    // ── 6. Build response ─────────────────────────────────────────────────
     const responseData = {
       meta: {
-        symbol   : upperSymbol,
-        exchange : usedExchange,
-        timestamp: new Date().toISOString()
+        symbol         : upperSymbol,
+        exchange       : usedExchange,
+        requestedDate  : requestedDateStr,
+        actualDataDate : actualDataDate,
+        timestamp      : new Date().toISOString()
       },
-      quote: quoteData.quote,
+      quote,
       technicals: {
         historical,
-        indicators: indicatorsWithoutPivots,
+        indicators : indicatorsWithoutPivots,
         pivots     : pivots ?? null,
-        patterns: {
-          candles: candlePatterns,
-          chart  : chartPatterns
-        },
+        patterns   : { candles: candlePatterns, chart: chartPatterns },
         signals
       },
       fundamentals,
@@ -751,6 +853,6 @@ module.exports = async function handler(req, res) {
 
   } catch (error) {
     console.error('Handler error:', error);
-    return res.status(500).json({ error: error.message, stack: process.env.NODE_ENV === 'development' ? error.stack : undefined });
+    return res.status(500).json({ error: error.message });
   }
 };
