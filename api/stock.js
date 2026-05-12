@@ -393,6 +393,14 @@ function computeIndicators(hist) {
     adx14       : latestAdx   ? { adx: rnd2(latestAdx.adx), plusDI: rnd2(latestAdx.pdi), minusDI: rnd2(latestAdx.mdi) } : null,
     obv         : last(obvArr) == null ? null : Math.round(last(obvArr)),
     volumeSma20 : last(volSma20) == null ? null : Math.round(last(volSma20)),
+    // Outlier-robust 20-day volume reference — median of the last 20 sessions.
+    // Useful for swing trading where a single 10–20× spike day shouldn't skew
+    // the "typical" volume baseline.
+    volumeMedian20: (() => {
+      if (volume.length < 20) return null;
+      const window = volume.slice(-20).slice().sort((a, b) => a - b);
+      return Math.round((window[9] + window[10]) / 2);
+    })(),
     pivots
   };
 }
@@ -697,31 +705,70 @@ async function scrapeFundamentals(symbol) {
       return null;
     };
 
-    // ── Shareholding pattern (latest quarter) ────────────────────────
+    // Helper — extract numeric cells from a table row (skipping the label cell)
+    const numericCells = ($row) => {
+      const cells = $row.find('td');
+      const out   = [];
+      for (let i = 1; i < cells.length; i++) {
+        const t = $(cells[i]).text().replace(/[,%]/g, '').trim();
+        const n = parseFloat(t);
+        if (!Number.isNaN(n)) out.push(n);
+      }
+      return out;
+    };
+
+    // ── Shareholding pattern  ────────────────────────────────────────
+    // Section #shareholding has two tables (quarterly + annual). The
+    // FIRST table holds the most recent quarterly columns; rightmost
+    // numeric cell is the latest period.
     let promoterHolding = null, fiiHolding = null, diiHolding = null, publicHolding = null;
-    $('#shareholding section.card, .shareholding-pattern table tr, table[data-graph-bar] tr').each((_, row) => {
-      const cells = $(row).find('td');
-      if (cells.length < 2) return;
-      const label = normRatioKey($(cells[0]).text());
-      const last  = parseFloat($(cells[cells.length-1]).text().replace(/[^\d.\-]/g, ''));
-      if (Number.isNaN(last)) return;
-      if (label.includes('promoter'))                                 promoterHolding = last;
-      else if (label.includes('fii') || label.includes('foreign'))    fiiHolding      = last;
-      else if (label.includes('dii') || label.includes('domestic'))   diiHolding      = last;
-      else if (label.includes('public'))                              publicHolding   = last;
+    const $shTable = $('#shareholding table').first();
+    $shTable.find('tr').each((_, row) => {
+      const $r    = $(row);
+      const label = normRatioKey($r.find('td, th').first().text());
+      if (!label) return;
+      const nums  = numericCells($r);
+      if (nums.length === 0) return;
+      const latest = nums[nums.length - 1];
+      if (label.startsWith('promoter'))                                  promoterHolding = latest;
+      else if (label.startsWith('fii') || label.includes('foreign'))     fiiHolding      = latest;
+      else if (label.startsWith('dii') || label.includes('domestic'))    diiHolding      = latest;
+      else if (label.startsWith('public'))                               publicHolding   = latest;
     });
 
-    // ── Debt-to-Equity + EPS-TTM — appear in the "Ratios" + "Quarters" sections
-    let debtToEquity = null, epsTtm = null;
-    $('table.data-table tr, section table tr').each((_, row) => {
-      const cells = $(row).find('td');
-      if (cells.length < 2) return;
-      const label = normRatioKey($(cells[0]).text());
-      const last  = parseFloat($(cells[cells.length-1]).text().replace(/[^\d.\-]/g, ''));
-      if (Number.isNaN(last)) return;
-      if (debtToEquity == null && (label === 'debt to equity' || label === 'debt equity ratio')) debtToEquity = last;
-      if (epsTtm       == null && label === 'eps in rs')      epsTtm = last;
-      if (epsTtm       == null && label === 'eps')            epsTtm = last;
+    // ── EPS-TTM = sum of last 4 quarterly EPS values ─────────────────
+    // Annual EPS is also captured as a robust fallback.
+    let epsTtm = null, epsAnnualLatest = null;
+    $('table').each((_, tbl) => {
+      const $tbl = $(tbl);
+      $tbl.find('tr').each((_, row) => {
+        const $r    = $(row);
+        const label = normRatioKey($r.find('td, th').first().text());
+        if (label !== 'eps in rs' && label !== 'eps') return;
+        const nums = numericCells($r);
+        if (nums.length === 0) return;
+        // Heuristic: a quarterly table has ≥ 6 columns; annual table has ≤ 5.
+        if (nums.length >= 4 && epsTtm == null) {
+          epsTtm = parseFloat(nums.slice(-4).reduce((s, x) => s + x, 0).toFixed(2));
+        }
+        if (nums.length <= 5 && epsAnnualLatest == null) {
+          epsAnnualLatest = nums[nums.length - 1];
+        }
+      });
+    });
+    if (epsTtm == null) epsTtm = epsAnnualLatest;
+
+    // ── Debt-to-Equity, Net Profit Margin, etc. from full-table parser
+    let debtToEquity = null;
+    $('table tr').each((_, row) => {
+      const $r    = $(row);
+      const label = normRatioKey($r.find('td, th').first().text());
+      const nums  = numericCells($r);
+      if (nums.length === 0) return;
+      const latest = nums[nums.length - 1];
+      if (debtToEquity == null && (label === 'debt to equity' || label === 'debt equity ratio')) {
+        debtToEquity = latest;
+      }
     });
 
     return {
@@ -1039,6 +1086,16 @@ module.exports = async function handler(req, res) {
       getFNO(upperSymbol)            .catch(e => { errors.fno           = e.message; return null; }),
       getSector(upperSymbol)         .catch(e => { errors.sector        = e.message; return null; })
     ]);
+
+    // Volume fallback: NSE's quote-equity totalTradedVolume can be 0 or
+    // missing after market close. The bhavcopy row for today (or the most
+    // recent trading day) carries the authoritative figure.
+    if (quote && (!quote.totalTradedVolume || quote.totalTradedVolume === 0) && historical.length > 0) {
+      const latest = historical[historical.length - 1];
+      if (latest && latest.volume) {
+        quote.totalTradedVolume = latest.volume;
+      }
+    }
 
     // Delivery fallback: if NSE delivery endpoint failed, derive from latest
     // bhavcopy row that has delivery data (NSE publishes DELIV_QTY/DELIV_PER
