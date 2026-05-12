@@ -47,40 +47,59 @@ async function fetchNSE(url, type = 'json') {
 
 // ─── A. Real-Time Quote ───────────────────────────────────────────────────────
 
+// Helper — convert anything-ish to a clean number, optionally rounded to N dp
+function num(v, dp) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = typeof v === 'number' ? v : parseFloat(String(v).replace(/,/g, ''));
+  if (Number.isNaN(n)) return null;
+  if (dp != null) return parseFloat(n.toFixed(dp));
+  return n;
+}
+
 async function getQuote(symbol, exchange) {
   // Try NSE first (unless exchange is explicitly 'bse')
   if (exchange !== 'bse') {
     try {
       const data      = await fetchNSE(`https://www.nseindia.com/api/quote-equity?symbol=${encodeURIComponent(symbol)}`);
-      const priceInfo = data.priceInfo    || {};
-      const metadata  = data.info         || {};
-      const preOpen   = data.preOpenMarket|| {};
-      const mktDept   = data.marketDeptOrderBook || {};
+      const priceInfo = data.priceInfo                    || {};
+      const security  = data.securityInfo                 || {};
+      const swDP      = data.securityWiseDP               || {};
+      const mktDept   = data.marketDeptOrderBook          || {};
+      const tradeInfo = mktDept.tradeInfo                 || {};
+      const preOpen   = data.preOpenMarket                || {};
 
-      const bid = mktDept.bid && mktDept.bid.length > 0
-        ? { price: mktDept.bid[0].price, qty: mktDept.bid[0].quantity } : null;
-      const ask = mktDept.ask && mktDept.ask.length > 0
-        ? { price: mktDept.ask[0].price, qty: mktDept.ask[0].quantity } : null;
+      // Volume:  intraday total lives in marketDeptOrderBook.tradeInfo (during/after market hours)
+      //          OR in securityWiseDP.quantityTraded (post-close)
+      //          OR fall back to preOpenMarket.totalTradedVolume (only useful pre-open)
+      const totalTradedVolume =
+        num(tradeInfo.totalTradedVolume)
+        ?? num(swDP.quantityTraded)
+        ?? num(preOpen.totalTradedVolume);
+
+      const bid = Array.isArray(mktDept.bid) && mktDept.bid.length > 0 && mktDept.bid[0].price
+        ? { price: num(mktDept.bid[0].price, 2), qty: num(mktDept.bid[0].quantity) } : null;
+      const ask = Array.isArray(mktDept.ask) && mktDept.ask.length > 0 && mktDept.ask[0].price
+        ? { price: num(mktDept.ask[0].price, 2), qty: num(mktDept.ask[0].quantity) } : null;
 
       return {
         source: 'nse',
         quote : {
-          ltp               : priceInfo.lastPrice                    ?? null,
-          open              : priceInfo.open                         ?? null,
-          high              : priceInfo.intraDayHighLow?.max         ?? null,
-          low               : priceInfo.intraDayHighLow?.min         ?? null,
-          previousClose     : priceInfo.previousClose                ?? null,
-          change            : priceInfo.change                       ?? null,
-          pChange           : priceInfo.pChange                      ?? null,
-          lowerCircuit      : priceInfo.lowerCP                      ?? null,
-          upperCircuit      : priceInfo.upperCP                      ?? null,
-          totalTradedVolume : preOpen.totalTradedVolume              ?? null,
-          vwap              : priceInfo.vwap                         ?? null,
+          ltp               : num(priceInfo.lastPrice, 2),
+          open              : num(priceInfo.open,      2),
+          high              : num(priceInfo.intraDayHighLow?.max, 2),
+          low               : num(priceInfo.intraDayHighLow?.min, 2),
+          previousClose     : num(priceInfo.previousClose, 2),
+          change            : num(priceInfo.change,  2),
+          pChange           : num(priceInfo.pChange, 2),
+          lowerCircuit      : num(priceInfo.lowerCP, 2),
+          upperCircuit      : num(priceInfo.upperCP, 2),
+          totalTradedVolume,
+          vwap              : num(priceInfo.vwap, 2),
           bid, ask,
-          week52High        : priceInfo.weekHighLow?.max             ?? null,
-          week52Low         : priceInfo.weekHighLow?.min             ?? null,
-          faceValue         : metadata.faceValue                     ?? null,
-          lastUpdateTime    : data.metadata?.lastUpdateTime          ?? new Date().toISOString()
+          week52High        : num(priceInfo.weekHighLow?.max, 2),
+          week52Low         : num(priceInfo.weekHighLow?.min, 2),
+          faceValue         : num(security.faceValue) ?? num(data.info?.faceValue),
+          lastUpdateTime    : data.metadata?.lastUpdateTime ?? new Date().toISOString()
         }
       };
     } catch (e) {
@@ -157,14 +176,12 @@ function fmtYYYYMMDD(d) {
 }
 
 function lastTradingDays(endDate, count) {
-  // Walk backwards from endDate, skipping Sat/Sun, until we have `count` dates.
-  // Holidays cannot be predicted, so we let the fetch return 404/HTML and we
-  // simply drop those days from the result set.
+  // Walk backwards from endDate (INCLUSIVE — try today first; the file may
+  // already be posted after market close).  Skip Sat/Sun.  Holidays cannot be
+  // predicted, so we let the fetch return 404/HTML and naturally drop them.
   const days = [];
   const d = new Date(endDate);
   d.setHours(12, 0, 0, 0);  // avoid TZ edge cases
-  // step back one extra day, because today's bhavcopy may not be posted yet
-  d.setDate(d.getDate() - 1);
   let safety = 0;
   while (days.length < count && safety++ < count * 2 + 10) {
     const dow = d.getDay();
@@ -282,18 +299,17 @@ function parseBseBhavcopyRow(csv, symbol) {
 async function fetchExchangeHistorical(exchange, symbol, dates) {
   const fetcher = exchange === 'bse' ? fetchBseBhavcopy : fetchNseBhavcopy;
   const parser  = exchange === 'bse' ? parseBseBhavcopyRow : parseNseBhavcopyRow;
-  const rows    = [];
+  const byDate  = new Map();   // dedupe by date — keep last write
 
-  // batched-parallel fetching to stay under the 30-s Vercel cap
   for (let i = 0; i < dates.length; i += BHAVCOPY_PARALLEL) {
     const batch = dates.slice(i, i + BHAVCOPY_PARALLEL);
     const csvs  = await Promise.all(batch.map(d => fetcher(d)));
-    csvs.forEach((csv, j) => {
+    csvs.forEach(csv => {
       const row = parser(csv, symbol);
-      if (row && row.date) rows.push(row);
+      if (row && row.date) byDate.set(row.date, row);
     });
   }
-  return rows.sort((a, b) => a.date.localeCompare(b.date));
+  return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
 }
 
 async function getHistorical(symbol, exchange, endDate) {
@@ -349,6 +365,7 @@ function computeIndicators(hist) {
   const latestMacd = last(macdArr);
   const latestBb   = last(bbArr);
   const latestAdx  = last(adxArr);
+  const rnd2 = v => v == null ? null : parseFloat(Number(v).toFixed(2));
 
   // Pivot Points from previous day's HLC
   let pivots = null;
@@ -367,15 +384,15 @@ function computeIndicators(hist) {
   }
 
   return {
-    sma : { '5': last(sma5), '10': last(sma10), '20': last(sma20), '50': last(sma50), '200': last(sma200) },
-    ema : { '5': last(ema5), '10': last(ema10), '20': last(ema20), '50': last(ema50), '200': last(ema200) },
-    rsi14       : last(rsi14),
-    macd        : latestMacd ? { macd: latestMacd.MACD, signal: latestMacd.signal, histogram: latestMacd.histogram } : null,
-    bollingerBands: latestBb  ? { upper: latestBb.upper, middle: latestBb.middle, lower: latestBb.lower } : null,
-    atr14       : last(atrArr),
-    adx14       : latestAdx   ? { adx: latestAdx.adx, plusDI: latestAdx.pdi, minusDI: latestAdx.mdi } : null,
-    obv         : last(obvArr),
-    volumeSma20 : last(volSma20),
+    sma : { '5': rnd2(last(sma5)), '10': rnd2(last(sma10)), '20': rnd2(last(sma20)), '50': rnd2(last(sma50)), '200': rnd2(last(sma200)) },
+    ema : { '5': rnd2(last(ema5)), '10': rnd2(last(ema10)), '20': rnd2(last(ema20)), '50': rnd2(last(ema50)), '200': rnd2(last(ema200)) },
+    rsi14       : rnd2(last(rsi14)),
+    macd        : latestMacd ? { macd: rnd2(latestMacd.MACD), signal: rnd2(latestMacd.signal), histogram: rnd2(latestMacd.histogram) } : null,
+    bollingerBands: latestBb  ? { upper: rnd2(latestBb.upper), middle: rnd2(latestBb.middle), lower: rnd2(latestBb.lower) } : null,
+    atr14       : rnd2(last(atrArr)),
+    adx14       : latestAdx   ? { adx: rnd2(latestAdx.adx), plusDI: rnd2(latestAdx.pdi), minusDI: rnd2(latestAdx.mdi) } : null,
+    obv         : last(obvArr) == null ? null : Math.round(last(obvArr)),
+    volumeSma20 : last(volSma20) == null ? null : Math.round(last(volSma20)),
     pivots
   };
 }
@@ -626,54 +643,112 @@ function computeSignals(hist, indicators) {
 
 // ─── F. Fundamentals ─────────────────────────────────────────────────────────
 
+// Normalize a Screener ratio label to a stable lookup key
+function normRatioKey(s) {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
 async function scrapeFundamentals(symbol) {
-  // Best-effort: try to scrape Screener.in (public, no auth required)
+  // Screener.in is the most reliable public fundamentals source (no auth).
+  // Strategy:
+  //   1. Pull the company page
+  //   2. Extract every {name, value} pair from #top-ratios
+  //   3. Match against several alias keys per metric (Screener labels change
+  //      e.g. "P/E"  vs  "Stock P/E", "Book Value" vs "Book Value Per Share")
+  //   4. Read promoter / FII / DII holding from the #quarterly-shp section
+  //   5. Read EPS-TTM and Debt-to-Equity from the relevant rows
+  const empty = {
+    pe: null, pb: null, epsTTM: null, roe: null, roce: null, debtToEquity: null,
+    netProfitMargin: null, operatingProfitMargin: null, salesGrowth3Y: null,
+    profitGrowth3Y: null, dividendYield: null, bookValuePerShare: null,
+    faceValue: null, marketCapCr: null, currentRatio: null,
+    promoterHolding: null, fiiHolding: null, diiHolding: null,
+    pledging: null, lastFilingDate: null, source: null
+  };
+
   try {
-    const url  = `https://www.screener.in/company/${encodeURIComponent(symbol)}/`;
-    const res  = await fetch(url, { headers: HEADERS });
+    const url  = `https://www.screener.in/company/${encodeURIComponent(symbol)}/consolidated/`;
+    let res  = await fetch(url, { headers: HEADERS });
+    // Some pages don't have /consolidated/ — fall back to standalone
+    if (!res.ok) res = await fetch(`https://www.screener.in/company/${encodeURIComponent(symbol)}/`, { headers: HEADERS });
     if (!res.ok) throw new Error(`screener ${res.status}`);
     const html = await res.text();
     const $    = cheerio.load(html);
 
-    const ratioMap = {};
-    $('#top-ratios li').each((_, el) => {
-      const name  = $(el).find('.name').text().trim().toLowerCase();
-      const value = parseFloat($(el).find('.value, .number').first().text().replace(/[^\d.-]/g, ''));
-      if (name && !isNaN(value)) ratioMap[name] = value;
+    // ── Top ratios block ─────────────────────────────────────────────
+    const ratios = {};
+    $('#top-ratios li, ul.flex.flex-wrap.list-unstyled li').each((_, el) => {
+      const $el  = $(el);
+      const name = normRatioKey($el.find('.name, .ratio-label').first().text());
+      // Pick the .number span specifically — avoids capturing the unit/currency
+      const numText = $el.find('.value .number, .number').first().text() || $el.find('.value').first().text();
+      const val  = parseFloat(String(numText).replace(/,/g, '').replace(/[^\d.\-]/g, ''));
+      if (name && !Number.isNaN(val)) ratios[name] = val;
+    });
+
+    const pick = (...aliases) => {
+      for (const a of aliases) {
+        const k = normRatioKey(a);
+        if (ratios[k] != null) return ratios[k];
+      }
+      return null;
+    };
+
+    // ── Shareholding pattern (latest quarter) ────────────────────────
+    let promoterHolding = null, fiiHolding = null, diiHolding = null, publicHolding = null;
+    $('#shareholding section.card, .shareholding-pattern table tr, table[data-graph-bar] tr').each((_, row) => {
+      const cells = $(row).find('td');
+      if (cells.length < 2) return;
+      const label = normRatioKey($(cells[0]).text());
+      const last  = parseFloat($(cells[cells.length-1]).text().replace(/[^\d.\-]/g, ''));
+      if (Number.isNaN(last)) return;
+      if (label.includes('promoter'))                                 promoterHolding = last;
+      else if (label.includes('fii') || label.includes('foreign'))    fiiHolding      = last;
+      else if (label.includes('dii') || label.includes('domestic'))   diiHolding      = last;
+      else if (label.includes('public'))                              publicHolding   = last;
+    });
+
+    // ── Debt-to-Equity + EPS-TTM — appear in the "Ratios" + "Quarters" sections
+    let debtToEquity = null, epsTtm = null;
+    $('table.data-table tr, section table tr').each((_, row) => {
+      const cells = $(row).find('td');
+      if (cells.length < 2) return;
+      const label = normRatioKey($(cells[0]).text());
+      const last  = parseFloat($(cells[cells.length-1]).text().replace(/[^\d.\-]/g, ''));
+      if (Number.isNaN(last)) return;
+      if (debtToEquity == null && (label === 'debt to equity' || label === 'debt equity ratio')) debtToEquity = last;
+      if (epsTtm       == null && label === 'eps in rs')      epsTtm = last;
+      if (epsTtm       == null && label === 'eps')            epsTtm = last;
     });
 
     return {
-      pe                    : ratioMap['p/e']                      ?? null,
-      pb                    : ratioMap['price to book value']       ?? null,
-      epsTTM                : null,
-      roe                   : ratioMap['return on equity']          ?? null,
-      roce                  : ratioMap['roce']                      ?? null,
-      debtToEquity          : ratioMap['debt to equity']            ?? null,
-      netProfitMargin       : null,
-      operatingProfitMargin : ratioMap['opm']                       ?? null,
-      salesGrowth3Y         : null,
-      profitGrowth3Y        : null,
-      dividendYield         : ratioMap['dividend yield']            ?? null,
-      bookValuePerShare     : ratioMap['book value']                ?? null,
-      faceValue             : null,
-      marketCapCr           : ratioMap['market cap']                ?? null,
-      currentRatio          : null,
-      promoterHolding       : null,
-      fiiHolding            : null,
-      diiHolding            : null,
-      pledging              : null,
+      pe                    : pick('Stock P/E', 'P/E'),
+      pb                    : pick('Price to Book Value', 'P/B', 'Price/Book'),
+      epsTTM                : epsTtm,
+      roe                   : pick('ROE', 'Return on Equity'),
+      roce                  : pick('ROCE', 'Return on Capital Employed'),
+      debtToEquity          : debtToEquity ?? pick('Debt to Equity'),
+      netProfitMargin       : pick('NPM', 'Net Profit Margin'),
+      operatingProfitMargin : pick('OPM', 'Operating Profit Margin'),
+      salesGrowth3Y         : pick('Sales Growth 3Yrs', 'Sales Growth 3Y'),
+      profitGrowth3Y        : pick('Profit Growth 3Yrs', 'Profit Growth 3Y'),
+      dividendYield         : pick('Dividend Yield'),
+      bookValuePerShare     : pick('Book Value'),
+      faceValue             : pick('Face Value'),
+      marketCapCr           : pick('Market Cap'),
+      currentRatio          : pick('Current Ratio'),
+      promoterHolding,
+      fiiHolding,
+      diiHolding,
+      pledging              : pick('Pledged Percentage', 'Pledged'),
       lastFilingDate        : null,
       source                : 'screener.in'
     };
   } catch (e) {
-    return {
-      pe: null, pb: null, epsTTM: null, roe: null, roce: null, debtToEquity: null,
-      netProfitMargin: null, operatingProfitMargin: null, salesGrowth3Y: null,
-      profitGrowth3Y: null, dividendYield: null, bookValuePerShare: null,
-      faceValue: null, marketCapCr: null, currentRatio: null,
-      promoterHolding: null, fiiHolding: null, diiHolding: null,
-      pledging: null, lastFilingDate: null, source: null
-    };
+    return empty;
   }
 }
 
@@ -701,10 +776,12 @@ async function getAnnouncements(symbol) {
   try {
     const data = await fetchNSE(`https://www.nseindia.com/api/corporate-announcements?index=equities&symbol=${encodeURIComponent(symbol)}`);
     if (Array.isArray(data) && data.length > 0) {
-      return data.slice(0, 5).map(item => ({
-        date    : item.anDt    ?? null,
-        desc    : item.desc    ?? null,
-        category: item.smName  ?? null
+      return data.slice(0, 10).map(item => ({
+        // NSE has shipped at least three names for the date field over the years
+        date    : item.an_dt ?? item.anDt ?? item.broadcastdate ?? item.sm_dt ?? null,
+        desc    : item.desc ?? item.attchmntText ?? item.sm_desc ?? item.sm_name ?? null,
+        category: item.smIndustry ?? item.smName ?? item.category ?? null,
+        url     : item.attchmntFile ? `https://nsearchives.nseindia.com/${item.attchmntFile}` : null
       }));
     }
   } catch (e) { /* ignore */ }
@@ -956,16 +1033,36 @@ module.exports = async function handler(req, res) {
       scrapeFundamentals(upperSymbol).catch(e => { errors.fundamentals  = e.message; return null; }),
       getNews(upperSymbol)           .catch(e => { errors.news          = e.message; return [];   }),
       getAnnouncements(upperSymbol)  .catch(e => { errors.announcements = e.message; return [];   }),
-      getDelivery(upperSymbol)       .catch(e => { errors.delivery      = e.message; return null; }),
+      getDelivery(upperSymbol)       .catch(e => { errors.delivery      = e.message; return null; }), // overridden below if null
       getBlockDeals(upperSymbol)     .catch(e => { errors.blockDeals    = e.message; return [];   }),
       getSurveillance(upperSymbol)   .catch(e => { errors.surveillance  = e.message; return null; }),
       getFNO(upperSymbol)            .catch(e => { errors.fno           = e.message; return null; }),
       getSector(upperSymbol)         .catch(e => { errors.sector        = e.message; return null; })
     ]);
 
-    // ── 4. Filter news / announcements by requested-date window ───────────
-    const news          = isHistorical ? withinDateWindow(newsAll,          'published', requestedDate, 30) : newsAll;
-    const announcements = isHistorical ? withinDateWindow(announcementsAll, 'date',      requestedDate, 30) : announcementsAll;
+    // Delivery fallback: if NSE delivery endpoint failed, derive from latest
+    // bhavcopy row that has delivery data (NSE publishes DELIV_QTY/DELIV_PER
+    // with a 1–2 day lag, so the most recent few rows may be null).
+    let deliveryFinal = delivery;
+    if (!deliveryFinal && historical.length > 0) {
+      for (let i = historical.length - 1; i >= 0; i--) {
+        const row = historical[i];
+        if (row.deliveryQty != null && row.deliveryPercent != null) {
+          deliveryFinal = {
+            date              : row.date,
+            deliveryQuantity  : row.deliveryQty,
+            deliveryPercentage: row.deliveryPercent
+          };
+          break;
+        }
+      }
+    }
+
+    // ── 4. Filter news / announcements to a 30-day window ending at requestedDate
+    // (Google News RSS returns mixed-age items even for live queries — without
+    //  filtering you can see headlines from years ago bleeding into the result.)
+    const news          = withinDateWindow(newsAll,          'published', requestedDate, 30).slice(0, 10);
+    const announcements = withinDateWindow(announcementsAll, 'date',      requestedDate, 30).slice(0, 10);
 
     // ── 5. Technicals — computed strictly on the sliced (≤ requestedDate) data ─
     const indicators                            = computeIndicators(historical);
@@ -994,7 +1091,7 @@ module.exports = async function handler(req, res) {
       fundamentals,
       news,
       announcements,
-      delivery,
+      delivery: deliveryFinal,
       blockDeals,
       surveillance,
       fno,
