@@ -120,55 +120,198 @@ async function getQuote(symbol, exchange) {
   };
 }
 
-// ─── B. Historical OHLCV (6 months) ──────────────────────────────────────────
+// ─── B. Historical OHLCV via Daily Bhavcopy Archives (NSE & BSE official) ────
+//
+// The NSE `/api/historical/...` endpoint has been intermittently returning 503
+// in 2026 — and the BSE `api.bseindia.com` host blocks datacenter IPs.
+// The most reliable AUTHORITATIVE sources we have are NSE and BSE's own daily
+// bhavcopy archives, which are plain CSV files published every trading day:
+//
+//   NSE: https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_DDMMYYYY.csv
+//   BSE: https://www.bseindia.com/download/BhavCopy/Equity/BhavCopy_BSE_CM_0_0_0_YYYYMMDD_F_0000.CSV
+//
+// Each file contains OHLCV for EVERY listed stock on that exchange that day.
+// We fetch the last N trading days in parallel (batches of 10) and extract
+// only the rows matching the requested symbol.
+
+const BHAVCOPY_DAYS    = 60;   // ~3 trading months — gives SMA50, EMA50, all swing-trading indicators
+const BHAVCOPY_PARALLEL = 10;  // batch size to keep within Vercel's 30-s budget
+
+const NSE_MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+function parseNseDateString(s) {
+  // "11-May-2026"  →  "2026-05-11"
+  if (!s) return null;
+  const m = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/);
+  if (!m) return null;
+  const month = NSE_MONTHS.indexOf(m[2]);
+  if (month < 0) return null;
+  return `${m[3]}-${String(month+1).padStart(2,'0')}-${m[1].padStart(2,'0')}`;
+}
+
+function fmtDDMMYYYY(d) {
+  return `${String(d.getDate()).padStart(2,'0')}${String(d.getMonth()+1).padStart(2,'0')}${d.getFullYear()}`;
+}
+function fmtYYYYMMDD(d) {
+  return `${d.getFullYear()}${String(d.getMonth()+1).padStart(2,'0')}${String(d.getDate()).padStart(2,'0')}`;
+}
+
+function lastTradingDays(endDate, count) {
+  // Walk backwards from endDate, skipping Sat/Sun, until we have `count` dates.
+  // Holidays cannot be predicted, so we let the fetch return 404/HTML and we
+  // simply drop those days from the result set.
+  const days = [];
+  const d = new Date(endDate);
+  d.setHours(12, 0, 0, 0);  // avoid TZ edge cases
+  // step back one extra day, because today's bhavcopy may not be posted yet
+  d.setDate(d.getDate() - 1);
+  let safety = 0;
+  while (days.length < count && safety++ < count * 2 + 10) {
+    const dow = d.getDay();
+    if (dow !== 0 && dow !== 6) days.push(new Date(d));
+    d.setDate(d.getDate() - 1);
+  }
+  return days;
+}
+
+function splitCsvLine(line) {
+  // Simple split — bhavcopy CSVs don't use quoted commas
+  return line.split(',').map(c => c.trim());
+}
+
+async function fetchNseBhavcopy(date) {
+  const url = `https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_${fmtDDMMYYYY(date)}.csv`;
+  try {
+    const res = await fetch(url, { headers: { ...HEADERS, Referer: 'https://www.nseindia.com/' } });
+    if (!res.ok) return null;
+    const ct = res.headers.get('content-type') || '';
+    if (ct.includes('text/html')) return null;   // 404 disguise (shouldn't happen for NSE archives, defensive)
+    return await res.text();
+  } catch { return null; }
+}
+
+async function fetchBseBhavcopy(date) {
+  const url = `https://www.bseindia.com/download/BhavCopy/Equity/BhavCopy_BSE_CM_0_0_0_${fmtYYYYMMDD(date)}_F_0000.CSV`;
+  try {
+    const res = await fetch(url, { headers: { ...HEADERS, Referer: 'https://www.bseindia.com/' } });
+    if (!res.ok) return null;
+    const ct = res.headers.get('content-type') || '';
+    // BSE returns 200 with HTML when the file doesn't exist (weekend / holiday / future date)
+    if (ct.includes('text/html')) return null;
+    return await res.text();
+  } catch { return null; }
+}
+
+function parseNseBhavcopyRow(csv, symbol) {
+  if (!csv) return null;
+  const lines  = csv.split(/\r?\n/);
+  if (lines.length < 2) return null;
+  const header = splitCsvLine(lines[0]);
+  const iSym   = header.indexOf('SYMBOL');
+  const iSer   = header.indexOf('SERIES');
+  const iDate  = header.indexOf('DATE1');
+  const iOpen  = header.indexOf('OPEN_PRICE');
+  const iHigh  = header.indexOf('HIGH_PRICE');
+  const iLow   = header.indexOf('LOW_PRICE');
+  const iClose = header.indexOf('CLOSE_PRICE');
+  const iVol   = header.indexOf('TTL_TRD_QNTY');
+  const iDelQ  = header.indexOf('DELIV_QTY');
+  const iDelP  = header.indexOf('DELIV_PER');
+  if (iSym < 0 || iOpen < 0) return null;
+
+  const upper = symbol.toUpperCase();
+  for (let i = 1; i < lines.length; i++) {
+    if (!lines[i]) continue;
+    const c = splitCsvLine(lines[i]);
+    if (c[iSym] !== upper) continue;
+    if (!['EQ','BE','BZ','BL'].includes(c[iSer])) continue;  // equity-class series only
+    return {
+      date           : parseNseDateString(c[iDate]),
+      open           : parseFloat(c[iOpen]),
+      high           : parseFloat(c[iHigh]),
+      low            : parseFloat(c[iLow]),
+      close          : parseFloat(c[iClose]),
+      volume         : parseInt(c[iVol], 10) || 0,
+      deliveryQty    : iDelQ >= 0 ? (parseInt(c[iDelQ], 10) || null) : null,
+      deliveryPercent: iDelP >= 0 ? (parseFloat(c[iDelP]) || null)   : null
+    };
+  }
+  return null;
+}
+
+function parseBseBhavcopyRow(csv, symbol) {
+  if (!csv) return null;
+  const lines  = csv.split(/\r?\n/);
+  if (lines.length < 2) return null;
+  const header = splitCsvLine(lines[0]);
+  const iSym   = header.indexOf('TckrSymb');
+  const iScrip = header.indexOf('FinInstrmId');
+  const iSeg   = header.indexOf('Sgmt');
+  const iTp    = header.indexOf('FinInstrmTp');
+  const iDate  = header.indexOf('TradDt');
+  const iOpen  = header.indexOf('OpnPric');
+  const iHigh  = header.indexOf('HghPric');
+  const iLow   = header.indexOf('LwPric');
+  const iClose = header.indexOf('ClsPric');
+  const iVol   = header.indexOf('TtlTradgVol');
+  if (iSym < 0 || iOpen < 0) return null;
+
+  const upper     = symbol.toUpperCase();
+  const isScrip   = /^\d+$/.test(symbol);
+  for (let i = 1; i < lines.length; i++) {
+    if (!lines[i]) continue;
+    const c = splitCsvLine(lines[i]);
+    if (iSeg >= 0 && c[iSeg] !== 'CM')  continue;   // cash market only
+    if (iTp  >= 0 && c[iTp]  !== 'STK') continue;   // stocks, not derivatives
+    const matches = isScrip ? c[iScrip] === symbol : c[iSym] === upper;
+    if (!matches) continue;
+    return {
+      date  : c[iDate],   // already YYYY-MM-DD
+      open  : parseFloat(c[iOpen]),
+      high  : parseFloat(c[iHigh]),
+      low   : parseFloat(c[iLow]),
+      close : parseFloat(c[iClose]),
+      volume: parseInt(c[iVol], 10) || 0,
+      deliveryQty    : null,
+      deliveryPercent: null
+    };
+  }
+  return null;
+}
+
+async function fetchExchangeHistorical(exchange, symbol, dates) {
+  const fetcher = exchange === 'bse' ? fetchBseBhavcopy : fetchNseBhavcopy;
+  const parser  = exchange === 'bse' ? parseBseBhavcopyRow : parseNseBhavcopyRow;
+  const rows    = [];
+
+  // batched-parallel fetching to stay under the 30-s Vercel cap
+  for (let i = 0; i < dates.length; i += BHAVCOPY_PARALLEL) {
+    const batch = dates.slice(i, i + BHAVCOPY_PARALLEL);
+    const csvs  = await Promise.all(batch.map(d => fetcher(d)));
+    csvs.forEach((csv, j) => {
+      const row = parser(csv, symbol);
+      if (row && row.date) rows.push(row);
+    });
+  }
+  return rows.sort((a, b) => a.date.localeCompare(b.date));
+}
 
 async function getHistorical(symbol, exchange, endDate) {
-  const toDate   = endDate instanceof Date ? new Date(endDate) : new Date();
-  const fromDate = new Date(toDate);
-  fromDate.setFullYear(fromDate.getFullYear() - 1);
+  const end   = endDate instanceof Date ? new Date(endDate) : new Date();
+  const dates = lastTradingDays(end, BHAVCOPY_DAYS);
 
-  const nseDate = d => `${String(d.getDate()).padStart(2,'0')}-${String(d.getMonth()+1).padStart(2,'0')}-${d.getFullYear()}`;
-  const bseDate = d => `${String(d.getDate()).padStart(2,'0')}/${String(d.getMonth()+1).padStart(2,'0')}/${d.getFullYear()}`;
-
-  if (exchange !== 'bse') {
-    try {
-      const url  = `https://www.nseindia.com/api/historical/cm/equity?symbol=${encodeURIComponent(symbol)}&series=[%22EQ%22]&from=${nseDate(fromDate)}&to=${nseDate(toDate)}`;
-      const data = await fetchNSE(url);
-      if (data && Array.isArray(data.data) && data.data.length > 0) {
-        return data.data
-          .map(item => ({
-            date  : new Date(item.CH_TIMESTAMP).toISOString().split('T')[0],
-            open  : Number(item.CH_OPENING_PRICE),
-            high  : Number(item.CH_TRADE_HIGH_PRICE),
-            low   : Number(item.CH_TRADE_LOW_PRICE),
-            close : Number(item.CH_CLOSING_PRICE),
-            volume: Number(item.CH_TOT_TRADED_QTY)
-          }))
-          .sort((a, b) => a.date.localeCompare(b.date));
-      }
-    } catch (e) { /* fall through to BSE */ }
+  // Caller passed exchange?  Only try that one.
+  if (exchange === 'nse' || exchange === 'bse') {
+    const rows = await fetchExchangeHistorical(exchange, symbol, dates);
+    return { exchange, data: rows };
   }
 
-  try {
-    const url  = `https://api.bseindia.com/BseIndiaAPI/api/StockReachGraph/w?scripcode=${symbol}&flag=0&fromdate=${bseDate(fromDate)}&todate=${bseDate(toDate)}`;
-    const res  = await fetch(url, { headers: { ...HEADERS, Referer: 'https://www.bseindia.com/' } });
-    const data = await res.json();
-    if (data && data.Data) {
-      const parsed = typeof data.Data === 'string' ? JSON.parse(data.Data) : data.Data;
-      return parsed
-        .map(item => ({
-          date  : new Date(item.dttm).toISOString().split('T')[0],
-          open  : parseFloat(item.open),
-          high  : parseFloat(item.high),
-          low   : parseFloat(item.low),
-          close : parseFloat(item.close),
-          volume: parseFloat(item.vol)
-        }))
-        .sort((a, b) => a.date.localeCompare(b.date));
-    }
-  } catch (e) { /* ignore */ }
+  // Auto-detect: NSE first, then BSE only if NSE returned nothing
+  const nseRows = await fetchExchangeHistorical('nse', symbol, dates);
+  if (nseRows.length > 0) return { exchange: 'nse', data: nseRows };
 
-  return [];
+  const bseRows = await fetchExchangeHistorical('bse', symbol, dates);
+  return { exchange: 'bse', data: bseRows };
 }
 
 // ─── C. Technical Indicators ──────────────────────────────────────────────────
@@ -765,31 +908,43 @@ module.exports = async function handler(req, res) {
   const errors = {};
 
   try {
-    // ── 1. Historical first (1-year window ending at requestedDate) ───────
-    const historicalAll = await getHistorical(upperSymbol, exchange, requestedDate)
-      .catch(e => { errors.historical = e.message; return []; });
+    // ── 1. Historical first (bhavcopy archives, last 60 trading days) ─────
+    const histResult = await getHistorical(upperSymbol, exchange, requestedDate)
+      .catch(e => { errors.historical = e.message; return { exchange: exchange || null, data: [] }; });
 
-    // Slice to entries on or before requestedDate (defensive — the API may
-    // already do this, but enforce it ourselves)
-    const historical     = historicalAll.filter(h => h.date <= requestedDateStr);
-    const actualDataDate = historical.length > 0 ? historical[historical.length - 1].date : null;
+    const detectedExchange = histResult.exchange || exchange || 'nse';
+    const historical       = histResult.data.filter(h => h.date <= requestedDateStr);
+    const actualDataDate   = historical.length > 0 ? historical[historical.length - 1].date : null;
+
+    if (historical.length === 0 && !errors.historical) {
+      errors.historical = `No bhavcopy rows found for ${upperSymbol} in last ${BHAVCOPY_DAYS} trading days on ${(exchange || 'auto').toUpperCase()}`;
+    }
 
     // ── 2. Quote ──────────────────────────────────────────────────────────
     let quote, usedExchange;
     if (isHistorical) {
-      // Reconstruct quote from historical OHLCV
+      // Past date — reconstruct quote from historical OHLCV
       quote        = buildHistoricalQuote(historical, requestedDateStr);
-      usedExchange = exchange || 'nse';
+      usedExchange = detectedExchange;
       if (!quote) errors.quote = 'No historical data found for requested date';
     } else {
+      // Live quote — try NSE first (its quote API is reliable), then BSE,
+      // and finally fall back to the most recent bhavcopy row.
       try {
-        const quoteData = await getQuote(upperSymbol, exchange);
+        const quoteData = await getQuote(upperSymbol, exchange || detectedExchange);
         quote           = quoteData.quote;
         usedExchange    = quoteData.source;
       } catch (e) {
         errors.quote = e.message;
-        quote        = null;
-        usedExchange = exchange || 'nse';
+        // Graceful fallback: derive quote from latest historical row
+        if (historical.length > 0) {
+          quote        = buildHistoricalQuote(historical, requestedDateStr);
+          usedExchange = detectedExchange;
+          if (quote) errors.quoteNote = 'Live quote unavailable; using latest bhavcopy row';
+        } else {
+          quote        = null;
+          usedExchange = detectedExchange;
+        }
       }
     }
 
