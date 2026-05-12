@@ -262,20 +262,24 @@ function detectCandles(hist) {
     if (range > 0 && body / range < 0.1)
       matches.push({ pattern: 'doji', date, confidence: 0.85 });
 
-    // Hammer  (long lower wick, small body, little/no upper wick)
-    if (body > 0 && botWick >= 2 * body && topWick <= body * 0.3)
+    // Use range-relative wick tolerance so tiny-body candles are handled correctly
+    const smallUpperWick = range > 0 && topWick / range <= 0.15;  // upper wick ≤ 15 % of range
+    const smallLowerWick = range > 0 && botWick / range <= 0.15;  // lower wick ≤ 15 % of range
+
+    // Hammer  (long lower wick, small body at top, little/no upper wick)
+    if (body > 0 && botWick >= 2 * body && smallUpperWick)
       matches.push({ pattern: 'hammer', date, confidence: 0.80 });
 
-    // Inverted Hammer
-    if (body > 0 && topWick >= 2 * body && botWick <= body * 0.3)
+    // Inverted Hammer  (long upper wick, small body at bottom, little/no lower wick)
+    if (body > 0 && topWick >= 2 * body && smallLowerWick)
       matches.push({ pattern: 'invertedHammer', date, confidence: 0.75 });
 
-    // Shooting Star  (bearish candle, big upper wick)
-    if (isBear(curr) && topWick >= 2 * body && botWick <= body * 0.3)
+    // Shooting Star  (bearish, long upper wick, small lower wick)
+    if (isBear(curr) && topWick >= 2 * body && smallLowerWick)
       matches.push({ pattern: 'shootingStar', date, confidence: 0.80 });
 
-    // Hanging Man  (bullish candle shape, long lower wick)
-    if (isBull(curr) && botWick >= 2 * body && topWick <= body * 0.3)
+    // Hanging Man  (bullish shape, long lower wick, small upper wick)
+    if (isBull(curr) && botWick >= 2 * body && smallUpperWick)
       matches.push({ pattern: 'hangingMan', date, confidence: 0.75 });
 
     // Bullish Engulfing
