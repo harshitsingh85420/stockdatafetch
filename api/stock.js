@@ -861,19 +861,107 @@ async function getAnnouncements(symbol) {
 }
 
 // ─── H. Delivery & Block Deals ───────────────────────────────────────────────
+//
+// Primary delivery source: NSE's daily MTO (Market-To-Open) DAT file at
+//   https://archives.nseindia.com/archives/equities/mto/MTO_DDMMYYYY.DAT
+// Despite the .DAT extension, the file is CSV.  Each data row begins with
+// "20,<srNo>,<symbol>,<series>,<qtyTraded>,<delivQty>,<delivPct>".
+// The file is published once after market close (typically by 7 PM IST) and
+// is the freshest free authoritative delivery source available.
+//
+// Fallback chain:
+//   1. MTO file for the requested date — walk back up to 7 trading days
+//   2. Bhavcopy-row scan (handled in the handler, uses DELIV_QTY/DELIV_PER
+//      columns already captured per-row)
+//   3. NSE's /api/security-wise-deliverable (often empty / 503 from
+//      datacenter IPs)
 
-async function getDelivery(symbol) {
+async function fetchMtoFile(date) {
+  const ddmmyyyy = `${String(date.getDate()).padStart(2,'0')}${String(date.getMonth()+1).padStart(2,'0')}${date.getFullYear()}`;
+  const url = `https://archives.nseindia.com/archives/equities/mto/MTO_${ddmmyyyy}.DAT`;
+  try {
+    const res = await fetch(url, { headers: { ...HEADERS, Referer: 'https://www.nseindia.com/' } });
+    if (!res.ok) return null;
+    const ct = res.headers.get('content-type') || '';
+    if (ct.includes('text/html')) return null; // 404 disguise
+    return await res.text();
+  } catch { return null; }
+}
+
+function parseMtoForSymbol(text, symbol) {
+  if (!text) return null;
+  const upper = symbol.toUpperCase();
+  // Row format:  20,<srNo>,<symbol>,<series>,<qtyTraded>,<delivQty>,<delivPct>
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.startsWith('20,')) continue;
+    const c = line.split(',');
+    if (c.length < 7) continue;
+    if ((c[2] || '').trim().toUpperCase() !== upper) continue;
+    const qtyTraded  = parseInt(c[4], 10) || 0;
+    const delivQty   = parseInt(c[5], 10) || 0;
+    const delivPct   = parseFloat(c[6]);
+    if (!delivQty) continue;
+    return {
+      series           : (c[3] || '').trim(),
+      quantityTraded   : qtyTraded,
+      deliveryQuantity : delivQty,
+      deliveryPercentage: Number.isNaN(delivPct) ? null : delivPct
+    };
+  }
+  return null;
+}
+
+async function getDelivery(symbol, asOfDate) {
+  const today = asOfDate instanceof Date ? new Date(asOfDate) : new Date();
+  today.setHours(12, 0, 0, 0);
+
+  // ── PRIMARY: walk back through up to 7 trading days for an MTO file ──
+  const d = new Date(today);
+  let safety = 0;
+  while (safety++ < 14) {
+    if (d.getDay() !== 0 && d.getDay() !== 6) {
+      const text = await fetchMtoFile(d);
+      if (text) {
+        const row = parseMtoForSymbol(text, symbol);
+        if (row) {
+          const dateStr = d.toISOString().slice(0, 10);
+          const lagDays = Math.floor((today - d) / 86400000);
+          const out = {
+            date              : dateStr,
+            deliveryQuantity  : row.deliveryQuantity,
+            deliveryPercentage: row.deliveryPercentage,
+            quantityTraded    : row.quantityTraded,
+            series            : row.series,
+            source            : 'mto',
+            lagDays
+          };
+          if (lagDays > 3) out.warning = `${lagDays} days stale — symbol may not have traded recently`;
+          return out;
+        }
+      }
+    }
+    d.setDate(d.getDate() - 1);
+  }
+
+  // ── SECONDARY: NSE's /api/security-wise-deliverable (best-effort) ────
   try {
     const data = await fetchNSE(`https://www.nseindia.com/api/security-wise-deliverable?symbol=${encodeURIComponent(symbol)}`);
     if (data?.data?.length > 0) {
-      const latest = data.data[0];
-      return {
-        date              : latest.secDate,
-        deliveryQuantity  : parseInt(latest.deliveryQuantity,    10)  || null,
-        deliveryPercentage: parseFloat(latest.deliveryToTradedQuantity) || null
+      const latest  = data.data[0];
+      const dateStr = latest.secDate || null;
+      const out = {
+        date              : dateStr,
+        deliveryQuantity  : parseInt(latest.deliveryQuantity, 10) || null,
+        deliveryPercentage: parseFloat(latest.deliveryToTradedQuantity) || null,
+        quantityTraded    : null,
+        series            : null,
+        source            : 'nse-deliverable-api',
+        lagDays           : null
       };
+      return out;
     }
-  } catch (e) { /* ignore */ }
+  } catch { /* ignore */ }
+
   return null;
 }
 
@@ -1105,7 +1193,7 @@ module.exports = async function handler(req, res) {
       scrapeFundamentals(upperSymbol).catch(e => { errors.fundamentals  = e.message; return null; }),
       getNews(upperSymbol)           .catch(e => { errors.news          = e.message; return [];   }),
       getAnnouncements(upperSymbol)  .catch(e => { errors.announcements = e.message; return [];   }),
-      getDelivery(upperSymbol)       .catch(e => { errors.delivery      = e.message; return null; }), // overridden below if null
+      getDelivery(upperSymbol, requestedDate).catch(e => { errors.delivery = e.message; return null; }),
       getBlockDeals(upperSymbol)     .catch(e => { errors.blockDeals    = e.message; return [];   }),
       getSurveillance(upperSymbol)   .catch(e => { errors.surveillance  = e.message; return null; }),
       getFNO(upperSymbol)            .catch(e => { errors.fno           = e.message; return null; }),
@@ -1122,19 +1210,62 @@ module.exports = async function handler(req, res) {
       }
     }
 
-    // Delivery fallback: if NSE delivery endpoint failed, derive from latest
-    // bhavcopy row that has delivery data (NSE publishes DELIV_QTY/DELIV_PER
-    // with a 1–2 day lag, so the most recent few rows may be null).
-    let deliveryFinal = delivery;
+    // Delivery: 3-tier resolution
+    //   1. T2T-implicit  — BE/BZ/BL series stocks settle on a gross basis,
+    //      so deliveryQty = totalTradedVolume and deliveryPct = 100% by rule
+    //   2. getDelivery() already tried MTO (PRIMARY) and NSE's /api/
+    //      security-wise-deliverable (SECONDARY)
+    //   3. Bhavcopy historical row scan — most recent row with DELIV_QTY
+    let deliveryFinal = null;
+
+    // ── Tier 1: T2T implicit (definitive for BE/BZ/BL stocks) ──
+    const seriesUpper = (nseSurvData?.metadataSeries || nseSurvData?.activeSeries?.[0] || '').toUpperCase();
+    const isT2TSeries = ['BE', 'BZ', 'BL'].includes(seriesUpper);
+    if (isT2TSeries && historical.length > 0) {
+      const latest = historical[historical.length - 1];
+      if (latest && latest.volume > 0) {
+        const lagDays = Math.floor(
+          (new Date(requestedDateStr) - new Date(latest.date)) / 86400000
+        );
+        deliveryFinal = {
+          date              : latest.date,
+          deliveryQuantity  : latest.volume,
+          deliveryPercentage: 100,
+          quantityTraded    : latest.volume,
+          series            : seriesUpper,
+          source            : 't2t-implicit',
+          lagDays,
+          note              : `${seriesUpper}-series (Trade-for-Trade) settles gross — 100% of traded volume is always delivered`
+        };
+      }
+    }
+
+    // ── Tier 2: MTO / /api/security-wise-deliverable (from getDelivery) ──
+    if (!deliveryFinal && delivery) {
+      deliveryFinal = delivery;
+    }
+
+    // ── Tier 3: bhavcopy historical row scan ──
     if (!deliveryFinal && historical.length > 0) {
       for (let i = historical.length - 1; i >= 0; i--) {
         const row = historical[i];
         if (row.deliveryQty != null && row.deliveryPercent != null) {
+          const lagDays = Math.floor(
+            (new Date(requestedDateStr) - new Date(row.date)) / 86400000
+          );
           deliveryFinal = {
             date              : row.date,
             deliveryQuantity  : row.deliveryQty,
-            deliveryPercentage: row.deliveryPercent
+            deliveryPercentage: row.deliveryPercent,
+            quantityTraded    : row.volume ?? null,
+            series            : null,
+            source            : 'bhavcopy_full',
+            lagDays
           };
+          if (lagDays > 3) {
+            deliveryFinal.warning =
+              `${lagDays} days stale — NSE's MTO file unavailable for this symbol and bhavcopy delivery data is published with a 1-2 day lag.`;
+          }
           break;
         }
       }
