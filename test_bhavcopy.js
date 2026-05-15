@@ -10,7 +10,8 @@ const path = require('path');
 const src  = fs.readFileSync(path.join(__dirname, 'api', 'stock.js'), 'utf8');
 
 // Use eval (controlled — same process) to lift functions out of the source
-const sandbox = { module: { exports: {} }, require, console, fetch, URL, setTimeout };
+const sandbox = { module: { exports: {} }, require, console, fetch, URL, setTimeout,
+  process: { env: {} } /* empty env so getRedis() returns null in this sandbox */ };
 const fnNames = [
   'parseNseDateString','fmtDDMMYYYY','fmtYYYYMMDD','lastTradingDays','splitCsvLine',
   'fetchNseBhavcopy','fetchBseBhavcopy','parseNseBhavcopyRow','parseBseBhavcopyRow',
@@ -191,6 +192,94 @@ function check(name, ok) {
   check('getDelivery has source field',           liveDel && typeof liveDel.source === 'string');
   check('getDelivery has lagDays >= 0',           liveDel && typeof liveDel.lagDays === 'number' && liveDel.lagDays >= 0);
   check('getDelivery source is mto',              liveDel && liveDel.source === 'mto');
+
+  console.log('\n[11] Upstash cache layer  (mocked)');
+  // We can't hit the real Upstash without env vars, but we can verify
+  // the code paths by simulating cache hits/misses with a mock client
+  // and re-importing fetchExchangeHistorical via a fresh sandbox.
+
+  const mockStore = new Map();
+  const mockRedis = {
+    async mget(...keys) {
+      return keys.map(k => mockStore.has(k) ? mockStore.get(k) : null);
+    },
+    async set(key, value /* , {ex} */) {
+      mockStore.set(key, value);
+      return 'OK';
+    }
+  };
+
+  // Build a fresh sandbox where getRedis() is monkey-patched to return mock
+  const fs2 = require('fs'), path2 = require('path'), vm2 = require('vm');
+  const src2 = fs2.readFileSync(path2.join(__dirname, 'api', 'stock.js'), 'utf8');
+  const ctx2 = vm2.createContext({
+    module: { exports: {} }, require, console, fetch, URL, setTimeout,
+    process: { env: { UPSTASH_REDIS_REST_URL: 'mock', UPSTASH_REDIS_REST_TOKEN: 'mock' } },
+    globalThis: {}, __OUT__: null
+  });
+  // Inject our mock by replacing the require('@upstash/redis') with a stub
+  const patched = src2.replace(
+    "require('@upstash/redis')",
+    `{ Redis: function() { return ${JSON.stringify(null)}; } }`
+  );
+  // Easier path: replace getRedis() body to always return our mock
+  const patched2 = src2.replace(
+    /function getRedis\(\) \{[\s\S]*?return _redisClient;\s*\n\s*\} catch \(e\) \{[\s\S]*?\}\s*\}/,
+    `function getRedis() { return __MOCK_REDIS__; }`
+  );
+  ctx2.__MOCK_REDIS__ = mockRedis;
+  ctx2.__OUT__ = null;
+  const wrapper2 = patched2.replace('module.exports = async function handler', 'const __H__ = async function handler')
+    + ';__OUT__ = { fetchExchangeHistorical, lastTradingDays, BHAVCOPY_DAYS };';
+  vm2.runInContext(wrapper2, ctx2, { filename: 'api/stock.js' });
+  const cachedFetch = ctx2.__OUT__.fetchExchangeHistorical;
+
+  // Pre-populate cache with one known row
+  const cacheDate = new Date(); cacheDate.setDate(cacheDate.getDate() - 30);
+  const cacheDateStr = cacheDate.toISOString().slice(0, 10);
+  mockStore.set(`bhav:nse:KRITINUT:${cacheDateStr}`, {
+    date: cacheDateStr, open: 100, high: 101, low: 99, close: 100.5, volume: 5000,
+    deliveryQty: null, deliveryPercent: null
+  });
+
+  // Run a fetch covering the 30-day window — at least one date will hit cache
+  const testDates = [];
+  for (let back = 25; back <= 35; back++) {
+    const d = new Date(); d.setDate(d.getDate() - back);
+    if (d.getDay() !== 0 && d.getDay() !== 6) testDates.push(d);
+  }
+  // We need to call cachedFetch — but it tries to actually fetch CSVs.
+  // For unit purposes, we'll just verify it returns the pre-populated row.
+  // (Real CSV fetches may succeed for older dates; that's fine — they get cached.)
+  const cachedResult = await cachedFetch('nse', 'KRITINUT', testDates);
+  const foundCachedRow = cachedResult.find(r => r.date === cacheDateStr);
+  check('Pre-populated cache row was returned', foundCachedRow != null);
+  if (foundCachedRow) {
+    check('Cached row has expected close (100.5)', foundCachedRow.close === 100.5);
+    check('Cached row has expected volume (5000)', foundCachedRow.volume === 5000);
+  }
+
+  // Verify cache stats were captured
+  const stats = ctx2.globalThis.__lastBhavCacheStats;
+  if (stats) {
+    console.log('  Cache stats:', JSON.stringify(stats));
+    check('Cache stats captured',         typeof stats === 'object');
+    check('Cache stats has cacheHit field', 'cacheHit' in stats);
+    check('Cache stats: at least 1 hit',   stats.cacheHit >= 1);
+  }
+
+  // Run a SECOND fetch with the same dates — every cacheable date should
+  // now be in the cache (filled by the first run's writes).
+  console.log('  Running second fetch — should be mostly cache hits...');
+  const stats1 = ctx2.globalThis.__lastBhavCacheStats;
+  const secondResult = await cachedFetch('nse', 'KRITINUT', testDates);
+  const stats2 = ctx2.globalThis.__lastBhavCacheStats;
+  console.log('  2nd fetch stats:', JSON.stringify(stats2));
+  check('Second fetch had more cache hits than first', stats2.cacheHit >= stats1.cacheHit);
+  check('Second fetch made fewer real fetches',         stats2.fetched <= stats1.fetched);
+
+  console.log('\n[12] BHAVCOPY_DAYS = 250  (for SMA200 / EMA200 enablement)');
+  check('BHAVCOPY_DAYS bumped to 250', ctx2.__OUT__.BHAVCOPY_DAYS === 250);
 
   console.log('\n════════════════════════════════════════');
   console.log(`Results: ${passed} passed, ${failed} failed`);

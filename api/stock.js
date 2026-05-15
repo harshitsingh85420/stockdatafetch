@@ -5,6 +5,32 @@ const { SMA, EMA, RSI, MACD, BollingerBands, ATR, ADX, OBV } = require('technica
 const cheerio = require('cheerio');
 const xml2js  = require('xml2js');
 
+// ─── Upstash Redis (optional — gracefully degrades if env not set) ───────────
+//
+// When UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN are present in the
+// environment, we use Upstash to persist per-row bhavcopy data forever.
+// Without them, the API still works exactly as before — just no caching.
+let _redisClient = null;
+let _redisInitTried = false;
+function getRedis() {
+  if (_redisInitTried) return _redisClient;
+  _redisInitTried = true;
+  if (!process.env.UPSTASH_REDIS_REST_URL || !process.env.UPSTASH_REDIS_REST_TOKEN) {
+    return null;
+  }
+  try {
+    const { Redis } = require('@upstash/redis');
+    _redisClient = new Redis({
+      url  : process.env.UPSTASH_REDIS_REST_URL,
+      token: process.env.UPSTASH_REDIS_REST_TOKEN
+    });
+    return _redisClient;
+  } catch (e) {
+    console.error('[redis] init failed:', e.message);
+    return null;
+  }
+}
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 const HEADERS = {
@@ -166,8 +192,10 @@ async function getQuote(symbol, exchange) {
 // We fetch the last N trading days in parallel (batches of 10) and extract
 // only the rows matching the requested symbol.
 
-const BHAVCOPY_DAYS    = 60;   // ~3 trading months — gives SMA50, EMA50, all swing-trading indicators
-const BHAVCOPY_PARALLEL = 10;  // batch size to keep within Vercel's 30-s budget
+const BHAVCOPY_DAYS     = 250; // ~1 trading year — enables SMA200 / EMA200
+const BHAVCOPY_PARALLEL = 20;  // higher concurrency since most fetches hit Upstash, not NSE
+const CACHE_FRESH_WINDOW_DAYS = 5;     // recent N days are never cached (corp action safety)
+const CACHE_TTL_SECONDS       = 365 * 86400;   // older rows kept for 1 year in Redis
 
 const NSE_MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
@@ -309,19 +337,99 @@ function parseBseBhavcopyRow(csv, symbol) {
   return null;
 }
 
+// Two-layer fetcher:
+//   • Recent N days (CACHE_FRESH_WINDOW_DAYS) are ALWAYS fetched fresh and
+//     never cached — guards against late corrections / late delivery updates
+//     that NSE sometimes makes within ~24-48 hr of original publication.
+//   • Older days are looked up in Upstash Redis with MGET (one round-trip
+//     for the whole window).  Cache misses are fetched, parsed, and written
+//     back with a 1-year TTL.  Cache hits skip the bhavcopy fetch entirely.
+//   • Days where the symbol simply didn't trade are cached as a small
+//     {__noTrade:true} sentinel so we never re-fetch them.
 async function fetchExchangeHistorical(exchange, symbol, dates) {
   const fetcher = exchange === 'bse' ? fetchBseBhavcopy : fetchNseBhavcopy;
   const parser  = exchange === 'bse' ? parseBseBhavcopyRow : parseNseBhavcopyRow;
-  const byDate  = new Map();   // dedupe by date — keep last write
+  const byDate  = new Map();
+  const today   = new Date(); today.setHours(0, 0, 0, 0);
+  const freshMs = CACHE_FRESH_WINDOW_DAYS * 86400000;
+  const upper   = symbol.toUpperCase();
+  const redis   = getRedis();
+  const stats   = { cacheHit: 0, cacheMiss: 0, noTrade: 0, fetched: 0, errors: 0 };
 
-  for (let i = 0; i < dates.length; i += BHAVCOPY_PARALLEL) {
-    const batch = dates.slice(i, i + BHAVCOPY_PARALLEL);
+  // Split dates: cache-eligible (old) vs fresh-window (always re-fetch)
+  const cacheEligible = [];   // [{ date: Date, dateStr: string, key: string }]
+  const alwaysFetch   = [];
+  for (const d of dates) {
+    const dateStr = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+    if (today - d > freshMs) {
+      cacheEligible.push({ date: d, dateStr, key: `bhav:${exchange}:${upper}:${dateStr}` });
+    } else {
+      alwaysFetch.push(d);
+    }
+  }
+
+  // ── 1) Cache lookup for old dates (one MGET) ───────────────────────
+  const toFetch = [...alwaysFetch];
+  if (redis && cacheEligible.length > 0) {
+    try {
+      const keys   = cacheEligible.map(e => e.key);
+      const values = await redis.mget(...keys);   // returns array
+      values.forEach((v, i) => {
+        const e = cacheEligible[i];
+        if (v == null) {
+          toFetch.push(e.date);
+          stats.cacheMiss++;
+        } else if (typeof v === 'object' && v.__noTrade) {
+          stats.noTrade++;       // symbol didn't trade that day — skip
+        } else if (v && v.date) {
+          byDate.set(v.date, v);
+          stats.cacheHit++;
+        } else {
+          toFetch.push(e.date);
+          stats.cacheMiss++;
+        }
+      });
+    } catch (e) {
+      console.error('[redis] mget failed:', e.message);
+      // graceful fallback: fetch everything fresh
+      for (const c of cacheEligible) toFetch.push(c.date);
+      stats.errors++;
+    }
+  } else {
+    // No Redis client — fetch everything
+    for (const c of cacheEligible) toFetch.push(c.date);
+  }
+
+  // ── 2) Fetch missing dates in parallel batches ─────────────────────
+  const writes = [];
+  for (let i = 0; i < toFetch.length; i += BHAVCOPY_PARALLEL) {
+    const batch = toFetch.slice(i, i + BHAVCOPY_PARALLEL);
     const csvs  = await Promise.all(batch.map(d => fetcher(d)));
-    csvs.forEach(csv => {
+    csvs.forEach((csv, j) => {
+      const d   = batch[j];
       const row = parser(csv, symbol);
+      stats.fetched++;
       if (row && row.date) byDate.set(row.date, row);
+
+      // Cache the result only if this date is outside the fresh window.
+      if (redis && (today - d) > freshMs) {
+        const dateStr = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+        const key     = `bhav:${exchange}:${upper}:${dateStr}`;
+        const payload = row || { __noTrade: true };
+        writes.push(
+          redis.set(key, payload, { ex: CACHE_TTL_SECONDS })
+            .catch(e => { console.error('[redis] set failed:', e.message); stats.errors++; })
+        );
+      }
     });
   }
+  // Don't await writes — they happen in the background.  Response can
+  // return without waiting for cache fills (best-effort caching).
+  // If you want guaranteed cache fills, change to:  await Promise.all(writes);
+
+  // Attach stats to a process-wide debug log (helpful for verifying KV behavior)
+  globalThis.__lastBhavCacheStats = { exchange, symbol: upper, window: dates.length, ...stats };
+
   return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
 }
 
