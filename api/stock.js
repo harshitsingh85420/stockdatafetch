@@ -663,9 +663,23 @@ function detectCandles(hist) {
 
 // ─── E. Chart Pattern Detection ───────────────────────────────────────────────
 
+// Linear regression slope (least squares) for a list of {x,y} points
+function lineSlope(points) {
+  if (!points || points.length < 2) return 0;
+  const n = points.length;
+  let sx = 0, sy = 0, sxy = 0, sxx = 0;
+  for (const p of points) { sx += p.x; sy += p.y; sxy += p.x * p.y; sxx += p.x * p.x; }
+  const denom = n * sxx - sx * sx;
+  if (denom === 0) return 0;
+  return (n * sxy - sx * sy) / denom;
+}
+
+const r2 = v => v == null ? null : parseFloat(Number(v).toFixed(2));
+
 function detectChartPatterns(hist) {
   if (!hist || hist.length < 20) {
-    return { doubleBottom: null, doubleTop: null, flag: null, headAndShoulders: null, triangle: null, cupAndHandle: null };
+    return { doubleBottom: null, doubleTop: null, flag: null, headAndShoulders: null,
+             inverseHeadAndShoulders: null, triangle: null, cupAndHandle: null };
   }
 
   const closes = hist.map(h => h.close);
@@ -673,7 +687,7 @@ function detectChartPatterns(hist) {
   const lows   = hist.map(h => h.low);
   const n      = closes.length;
 
-  // Find local extrema
+  // Local extrema (2-bar confirmation on each side)
   const localLows  = [];
   const localHighs = [];
   for (let i = 2; i < n - 2; i++) {
@@ -683,37 +697,152 @@ function detectChartPatterns(hist) {
       localHighs.push({ idx: i, val: highs[i] });
   }
 
-  // Double Bottom
+  // ── Double Bottom / Double Top  (existing) ──────────────────────────
   let doubleBottom = null;
   if (localLows.length >= 2) {
     const [b1, b2] = localLows.slice(-2);
     if (Math.abs(b1.val - b2.val) / b1.val < 0.03 && b2.idx > b1.idx + 5) {
       const neckline = Math.max(...highs.slice(b1.idx, b2.idx));
-      doubleBottom   = { present: true, neckline: parseFloat(neckline.toFixed(2)), target: parseFloat((neckline + (neckline - b2.val)).toFixed(2)), confidence: 0.75 };
+      doubleBottom = { present: true, neckline: r2(neckline),
+        target: r2(neckline + (neckline - b2.val)), confidence: 0.75 };
     }
   }
-
-  // Double Top
   let doubleTop = null;
   if (localHighs.length >= 2) {
     const [t1, t2] = localHighs.slice(-2);
     if (Math.abs(t1.val - t2.val) / t1.val < 0.03 && t2.idx > t1.idx + 5) {
       const neckline = Math.min(...lows.slice(t1.idx, t2.idx));
-      doubleTop      = { present: true, neckline: parseFloat(neckline.toFixed(2)), target: parseFloat((neckline - (t2.val - neckline)).toFixed(2)), confidence: 0.75 };
+      doubleTop = { present: true, neckline: r2(neckline),
+        target: r2(neckline - (t2.val - neckline)), confidence: 0.75 };
     }
   }
 
-  // Bullish Flag  (sharp rise followed by tight consolidation)
+  // ── Bullish / Bearish Flag  (existing — kept) ───────────────────────
   let flag = null;
   if (n >= 20) {
     const pole        = closes.slice(n - 20, n - 10);
     const consolid    = closes.slice(n - 10);
     const poleReturn  = (pole[pole.length-1] - pole[0]) / pole[0];
     const consolidRange = (Math.max(...consolid) - Math.min(...consolid)) / consolid[0];
-    if (poleReturn > 0.05 && consolidRange < 0.03) {
-      flag = { present: true, type: 'bullish', target: parseFloat((closes[n-1] * (1 + poleReturn)).toFixed(2)), confidence: 0.70 };
-    } else if (poleReturn < -0.05 && consolidRange < 0.03) {
-      flag = { present: true, type: 'bearish', target: parseFloat((closes[n-1] * (1 + poleReturn)).toFixed(2)), confidence: 0.70 };
+    if (poleReturn > 0.05 && consolidRange < 0.03)
+      flag = { present: true, type: 'bullish', target: r2(closes[n-1] * (1 + poleReturn)), confidence: 0.70 };
+    else if (poleReturn < -0.05 && consolidRange < 0.03)
+      flag = { present: true, type: 'bearish', target: r2(closes[n-1] * (1 + poleReturn)), confidence: 0.70 };
+  }
+
+  // ── Head & Shoulders  (top reversal) ────────────────────────────────
+  // Last 3 pivot highs: middle (head) is highest, two shoulders within 5%.
+  // Neckline = average of the two intervening lows.
+  let headAndShoulders = null;
+  if (localHighs.length >= 3) {
+    const [s1, head, s3] = localHighs.slice(-3);
+    if (head.val > s1.val && head.val > s3.val) {
+      const shoulderRatio = Math.abs(s1.val - s3.val) / Math.max(s1.val, s3.val);
+      if (shoulderRatio < 0.05 && head.idx - s1.idx >= 4 && s3.idx - head.idx >= 4) {
+        // Find lows between the three highs to anchor the neckline
+        const lowBetween12 = Math.min(...lows.slice(s1.idx, head.idx + 1));
+        const lowBetween23 = Math.min(...lows.slice(head.idx, s3.idx + 1));
+        const neckline = (lowBetween12 + lowBetween23) / 2;
+        headAndShoulders = {
+          present  : true,
+          leftShoulder : r2(s1.val),
+          head     : r2(head.val),
+          rightShoulder: r2(s3.val),
+          neckline : r2(neckline),
+          target   : r2(neckline - (head.val - neckline)),
+          confidence: 0.75
+        };
+      }
+    }
+  }
+
+  // ── Inverse Head & Shoulders  (bottom reversal) ─────────────────────
+  let inverseHeadAndShoulders = null;
+  if (localLows.length >= 3) {
+    const [s1, head, s3] = localLows.slice(-3);
+    if (head.val < s1.val && head.val < s3.val) {
+      const shoulderRatio = Math.abs(s1.val - s3.val) / Math.max(s1.val, s3.val);
+      if (shoulderRatio < 0.05 && head.idx - s1.idx >= 4 && s3.idx - head.idx >= 4) {
+        const highBetween12 = Math.max(...highs.slice(s1.idx, head.idx + 1));
+        const highBetween23 = Math.max(...highs.slice(head.idx, s3.idx + 1));
+        const neckline = (highBetween12 + highBetween23) / 2;
+        inverseHeadAndShoulders = {
+          present  : true,
+          leftShoulder : r2(s1.val),
+          head     : r2(head.val),
+          rightShoulder: r2(s3.val),
+          neckline : r2(neckline),
+          target   : r2(neckline + (neckline - head.val)),
+          confidence: 0.75
+        };
+      }
+    }
+  }
+
+  // ── Triangles  (ascending / descending / symmetrical) ───────────────
+  // Use linear regression slopes over the last ≥ 3 pivot highs and lows.
+  // Slope thresholds are scaled by the average price so the same code works
+  // for ₹50 and ₹50,000 stocks.
+  let triangle = null;
+  if (localHighs.length >= 3 && localLows.length >= 3) {
+    const recentH = localHighs.slice(-Math.min(5, localHighs.length));
+    const recentL = localLows.slice(-Math.min(5, localLows.length));
+    const slopeH = lineSlope(recentH.map(p => ({ x: p.idx, y: p.val })));
+    const slopeL = lineSlope(recentL.map(p => ({ x: p.idx, y: p.val })));
+    const avgPrice = closes.reduce((s, v) => s + v, 0) / closes.length;
+    const flat = avgPrice * 0.0003;   // ~3 bps per bar — treat as horizontal
+
+    const apex = (slopeH !== slopeL)
+      ? r2((recentL[recentL.length-1].val - recentH[recentH.length-1].val + slopeH * recentH[recentH.length-1].idx - slopeL * recentL[recentL.length-1].idx) / (slopeH - slopeL))
+      : null;
+    const baseRet = (type) => ({
+      present: true, type,
+      slopeHigh: r2(slopeH), slopeLow: r2(slopeL),
+      lastHigh: r2(recentH[recentH.length-1].val),
+      lastLow : r2(recentL[recentL.length-1].val),
+      confidence: 0.70
+    });
+
+    if (slopeH < -flat && slopeL > flat)       triangle = baseRet('symmetrical');
+    else if (Math.abs(slopeH) <= flat && slopeL > flat)  triangle = baseRet('ascending');
+    else if (slopeH < -flat && Math.abs(slopeL) <= flat) triangle = baseRet('descending');
+  }
+
+  // ── Cup & Handle  (bullish continuation) ────────────────────────────
+  // U-shape over ~50 bars: starts at a high, dips to a trough ~15-50% below,
+  // recovers to within 5% of the starting high.  Followed by a small handle
+  // (~10 bars) pulling back < 15%.
+  let cupAndHandle = null;
+  if (n >= 60) {
+    const cupLen   = 50;
+    const handleLen = 10;
+    const cup      = closes.slice(n - cupLen - handleLen, n - handleLen);
+    const handle   = closes.slice(n - handleLen);
+
+    const cupStart   = cup[0];
+    const cupEnd     = cup[cup.length - 1];
+    const cupMin     = Math.min(...cup);
+    const cupMinIdx  = cup.indexOf(cupMin);
+    const shapeOk    = Math.abs(cupStart - cupEnd) / cupStart < 0.05;
+    const minNearMid = cupMinIdx > cupLen * 0.25 && cupMinIdx < cupLen * 0.75;
+    const cupDepth   = (cupStart - cupMin) / cupStart;
+    const cupValid   = shapeOk && minNearMid && cupDepth >= 0.10 && cupDepth <= 0.50;
+
+    const handleStart = handle[0];
+    const handleMin   = Math.min(...handle);
+    const handleDepth = (handleStart - handleMin) / handleStart;
+    const handleValid = handleDepth >= 0 && handleDepth < 0.15;
+
+    if (cupValid && handleValid) {
+      const rim = (cupStart + cupEnd) / 2;
+      cupAndHandle = {
+        present  : true,
+        rim      : r2(rim),
+        cupLow   : r2(cupMin),
+        handleLow: r2(handleMin),
+        target   : r2(rim + (rim - cupMin)),
+        confidence: 0.65
+      };
     }
   }
 
@@ -721,9 +850,10 @@ function detectChartPatterns(hist) {
     doubleBottom,
     doubleTop,
     flag,
-    headAndShoulders: null,   // complex – requires full detection algo; best-effort null
-    triangle        : null,
-    cupAndHandle    : null
+    headAndShoulders,
+    inverseHeadAndShoulders,
+    triangle,
+    cupAndHandle
   };
 }
 
@@ -893,18 +1023,64 @@ async function scrapeFundamentals(symbol) {
     });
     if (epsTtm == null) epsTtm = epsAnnualLatest;
 
-    // ── Debt-to-Equity, Net Profit Margin, etc. from full-table parser
-    let debtToEquity = null;
-    $('table tr').each((_, row) => {
+    // ── Balance Sheet → Debt-to-Equity (computed) ────────────────────
+    // Screener's free page exposes Borrowings, Equity Capital, Reserves
+    // as separate rows; D/E = Borrowings / (EquityCapital + Reserves)
+    let bsEquityCapital = null, bsReserves = null, bsBorrowings = null;
+    $('#balance-sheet table tr').each((_, row) => {
       const $r    = $(row);
       const label = normRatioKey($r.find('td, th').first().text());
       const nums  = numericCells($r);
       if (nums.length === 0) return;
       const latest = nums[nums.length - 1];
-      if (debtToEquity == null && (label === 'debt to equity' || label === 'debt equity ratio')) {
-        debtToEquity = latest;
-      }
+      if (label === 'equity capital')           bsEquityCapital = latest;
+      else if (label === 'reserves')            bsReserves      = latest;
+      else if (label.startsWith('borrowings'))  bsBorrowings    = latest;
     });
+    let debtToEquity = null;
+    if (bsBorrowings != null && bsEquityCapital != null && bsReserves != null) {
+      const totalEquity = bsEquityCapital + bsReserves;
+      if (totalEquity > 0) debtToEquity = parseFloat((bsBorrowings / totalEquity).toFixed(2));
+    }
+
+    // ── Ratios section → operational efficiency metrics ──────────────
+    let debtorDays = null, inventoryDays = null, daysPayable = null,
+        cashConversionCycle = null, workingCapitalDays = null;
+    $('#ratios table tr').each((_, row) => {
+      const $r    = $(row);
+      const label = normRatioKey($r.find('td, th').first().text());
+      const nums  = numericCells($r);
+      if (nums.length === 0) return;
+      const latest = nums[nums.length - 1];
+      if (label === 'debtor days')                debtorDays           = latest;
+      else if (label === 'inventory days')        inventoryDays        = latest;
+      else if (label === 'days payable')          daysPayable          = latest;
+      else if (label === 'cash conversion cycle') cashConversionCycle  = latest;
+      else if (label === 'working capital days')  workingCapitalDays   = latest;
+    });
+
+    // ── Net Profit Margin (computed from latest annual P&L) ──────────
+    // Picks the rightmost cells of "Net Profit" and "Sales" rows in the
+    // annual P&L table (it has ≤ 5 columns; quarterly has more).
+    let netProfitMargin = null, opmLatest = null;
+    let annualSales = null, annualNetProfit = null;
+    $('#profit-loss table').each((_, tbl) => {
+      const cols = $(tbl).find('tr').first().find('td, th').length;
+      if (cols > 6) return;  // skip quarterly table
+      $(tbl).find('tr').each((_, row) => {
+        const $r    = $(row);
+        const label = normRatioKey($r.find('td, th').first().text());
+        const nums  = numericCells($r);
+        if (nums.length === 0) return;
+        const latest = nums[nums.length - 1];
+        if (label.startsWith('sales'))            annualSales      = latest;
+        else if (label.startsWith('net profit'))  annualNetProfit  = latest;
+        else if (label === 'opm')                 opmLatest        = latest;
+      });
+    });
+    if (annualSales && annualNetProfit) {
+      netProfitMargin = parseFloat((100 * annualNetProfit / annualSales).toFixed(2));
+    }
 
     return {
       pe                    : pick('Stock P/E', 'P/E'),
@@ -912,20 +1088,30 @@ async function scrapeFundamentals(symbol) {
       epsTTM                : epsTtm,
       roe                   : pick('ROE', 'Return on Equity'),
       roce                  : pick('ROCE', 'Return on Capital Employed'),
-      debtToEquity          : debtToEquity ?? pick('Debt to Equity'),
-      netProfitMargin       : pick('NPM', 'Net Profit Margin'),
-      operatingProfitMargin : pick('OPM', 'Operating Profit Margin'),
+      debtToEquity,                                                     // NEW: computed from balance sheet
+      netProfitMargin       : netProfitMargin ?? pick('NPM', 'Net Profit Margin'),
+      operatingProfitMargin : opmLatest ?? pick('OPM', 'Operating Profit Margin'),
       salesGrowth3Y         : pick('Sales Growth 3Yrs', 'Sales Growth 3Y'),
       profitGrowth3Y        : pick('Profit Growth 3Yrs', 'Profit Growth 3Y'),
       dividendYield         : pick('Dividend Yield'),
       bookValuePerShare     : pick('Book Value'),
       faceValue             : pick('Face Value'),
       marketCapCr           : pick('Market Cap'),
-      currentRatio          : pick('Current Ratio'),
+      currentRatio          : pick('Current Ratio'),                    // null on Screener consolidated page
       promoterHolding,
       fiiHolding,
       diiHolding,
       pledging              : pick('Pledged Percentage', 'Pledged'),
+      // Operational efficiency metrics from #ratios section  (NEW)
+      debtorDays,
+      inventoryDays,
+      daysPayable,
+      cashConversionCycle,
+      workingCapitalDays,
+      // Raw balance-sheet figures (latest annual, in ₹ Cr)  (NEW)
+      balanceSheet          : (bsEquityCapital != null || bsReserves != null || bsBorrowings != null)
+        ? { equityCapitalCr: bsEquityCapital, reservesCr: bsReserves, borrowingsCr: bsBorrowings }
+        : null,
       lastFilingDate        : null,
       source                : 'screener.in'
     };
@@ -1381,11 +1567,13 @@ module.exports = async function handler(req, res) {
       }
     }
 
-    // ── 4. Filter news / announcements to a 30-day window ending at requestedDate
+    // ── 4. Filter news / announcements to a 60-day window ending at requestedDate
     // (Google News RSS returns mixed-age items even for live queries — without
-    //  filtering you can see headlines from years ago bleeding into the result.)
-    const news          = withinDateWindow(newsAll,          'published', requestedDate, 30).slice(0, 10);
-    const announcements = withinDateWindow(announcementsAll, 'date',      requestedDate, 30).slice(0, 10);
+    //  filtering you can see headlines from years ago bleeding into the result.
+    //  Lifted from 30 → 60 days because low-coverage stocks like KRITINUT
+    //  yielded only 1 headline; 60d typically yields 5-10.)
+    const news          = withinDateWindow(newsAll,          'published', requestedDate, 60).slice(0, 10);
+    const announcements = withinDateWindow(announcementsAll, 'date',      requestedDate, 60).slice(0, 10);
 
     // ── 5. Technicals — computed strictly on the sliced (≤ requestedDate) data ─
     const indicators                            = computeIndicators(historical);
