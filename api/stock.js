@@ -193,7 +193,7 @@ async function getQuote(symbol, exchange) {
 // only the rows matching the requested symbol.
 
 const BHAVCOPY_DAYS     = 250; // ~1 trading year — enables SMA200 / EMA200
-const BHAVCOPY_PARALLEL = 20;  // higher concurrency since most fetches hit Upstash, not NSE
+const BHAVCOPY_PARALLEL = 30;  // higher concurrency since most fetches hit Upstash, not NSE
 const CACHE_FRESH_WINDOW_DAYS = 5;     // recent N days are never cached (corp action safety)
 const CACHE_TTL_SECONDS       = 365 * 86400;   // older rows kept for 1 year in Redis
 
