@@ -1023,19 +1023,32 @@ async function scrapeFundamentals(symbol) {
     });
     if (epsTtm == null) epsTtm = epsAnnualLatest;
 
-    // ── Balance Sheet → Debt-to-Equity (computed) ────────────────────
-    // Screener's free page exposes Borrowings, Equity Capital, Reserves
-    // as separate rows; D/E = Borrowings / (EquityCapital + Reserves)
+    // ── Balance Sheet → Debt-to-Equity (computed) + raw figures ─────
+    // Screener exposes Borrowings, Equity Capital, Reserves as separate
+    // rows; D/E = Borrowings / (EquityCapital + Reserves)
+    // We also surface Other Liabilities / Other Assets / Total Assets etc.
+    // so callers can do their own current-ratio approximation
+    // (Screener's free page does NOT break out current vs non-current).
     let bsEquityCapital = null, bsReserves = null, bsBorrowings = null;
+    let bsOtherLiab    = null, bsOtherAssets = null, bsTotalLiab = null,
+        bsTotalAssets  = null, bsFixedAssets = null, bsInvestments = null,
+        bsCwip         = null;
     $('#balance-sheet table tr').each((_, row) => {
       const $r    = $(row);
       const label = normRatioKey($r.find('td, th').first().text());
       const nums  = numericCells($r);
       if (nums.length === 0) return;
       const latest = nums[nums.length - 1];
-      if (label === 'equity capital')           bsEquityCapital = latest;
-      else if (label === 'reserves')            bsReserves      = latest;
-      else if (label.startsWith('borrowings'))  bsBorrowings    = latest;
+      if      (label === 'equity capital')           bsEquityCapital = latest;
+      else if (label === 'reserves')                 bsReserves      = latest;
+      else if (label.startsWith('borrowings'))       bsBorrowings    = latest;
+      else if (label.startsWith('other liabilities'))bsOtherLiab     = latest;
+      else if (label === 'total liabilities')        bsTotalLiab     = latest;
+      else if (label.startsWith('fixed assets'))     bsFixedAssets   = latest;
+      else if (label === 'cwip')                     bsCwip          = latest;
+      else if (label === 'investments')              bsInvestments   = latest;
+      else if (label.startsWith('other assets'))     bsOtherAssets   = latest;
+      else if (label === 'total assets')             bsTotalAssets   = latest;
     });
     let debtToEquity = null;
     if (bsBorrowings != null && bsEquityCapital != null && bsReserves != null) {
@@ -1098,6 +1111,7 @@ async function scrapeFundamentals(symbol) {
       faceValue             : pick('Face Value'),
       marketCapCr           : pick('Market Cap'),
       currentRatio          : pick('Current Ratio'),                    // null on Screener consolidated page
+      currentRatioNote      : 'Current Ratio not exposed on Screener\'s free /consolidated page; Moneycontrol has stale data for low-coverage stocks; Tickertape may lack coverage. To approximate, use balanceSheet.otherAssetsCr / balanceSheet.otherLiabilitiesCr (rough — both rows include some non-current items).',
       promoterHolding,
       fiiHolding,
       diiHolding,
@@ -1108,9 +1122,20 @@ async function scrapeFundamentals(symbol) {
       daysPayable,
       cashConversionCycle,
       workingCapitalDays,
-      // Raw balance-sheet figures (latest annual, in ₹ Cr)  (NEW)
-      balanceSheet          : (bsEquityCapital != null || bsReserves != null || bsBorrowings != null)
-        ? { equityCapitalCr: bsEquityCapital, reservesCr: bsReserves, borrowingsCr: bsBorrowings }
+      // Raw balance-sheet figures (latest annual, in ₹ Cr)  (expanded)
+      balanceSheet          : (bsEquityCapital != null || bsTotalAssets != null)
+        ? {
+            equityCapitalCr   : bsEquityCapital,
+            reservesCr        : bsReserves,
+            borrowingsCr      : bsBorrowings,
+            otherLiabilitiesCr: bsOtherLiab,
+            totalLiabilitiesCr: bsTotalLiab,
+            fixedAssetsCr     : bsFixedAssets,
+            cwipCr            : bsCwip,
+            investmentsCr     : bsInvestments,
+            otherAssetsCr     : bsOtherAssets,
+            totalAssetsCr     : bsTotalAssets
+          }
         : null,
       lastFilingDate        : null,
       source                : 'screener.in'
