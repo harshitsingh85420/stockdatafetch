@@ -81,6 +81,18 @@ async function getQuote(symbol, exchange) {
       const ask = Array.isArray(mktDept.ask) && mktDept.ask.length > 0 && mktDept.ask[0].price
         ? { price: num(mktDept.ask[0].price, 2), qty: num(mktDept.ask[0].quantity) } : null;
 
+      // Pull surveillance + series info so the handler can build the full
+      // surveillance block.  NSE puts the human-readable "surv" string under
+      // securityInfo.surveillance — e.g. "ESM - I (34)" / "ASM - II" / etc.
+      const surv = security.surveillance || {};
+      const nseSurvData = {
+        rawNseString : surv.surv ?? null,
+        rawNseDesc   : surv.desc ?? null,
+        activeSeries : Array.isArray(data.info?.activeSeries) ? data.info.activeSeries : [],
+        metadataSeries: data.metadata?.series ?? null,
+        issuedSize   : num(security.issuedSize)
+      };
+
       return {
         source: 'nse',
         quote : {
@@ -100,7 +112,8 @@ async function getQuote(symbol, exchange) {
           week52Low         : num(priceInfo.weekHighLow?.min, 2),
           faceValue         : num(security.faceValue) ?? num(data.info?.faceValue),
           lastUpdateTime    : data.metadata?.lastUpdateTime ?? new Date().toISOString()
-        }
+        },
+        nseSurvData
       };
     } catch (e) {
       if (exchange === 'nse') throw e; // hard-fail if user specified NSE
@@ -393,13 +406,25 @@ function computeIndicators(hist) {
     adx14       : latestAdx   ? { adx: rnd2(latestAdx.adx), plusDI: rnd2(latestAdx.pdi), minusDI: rnd2(latestAdx.mdi) } : null,
     obv         : last(obvArr) == null ? null : Math.round(last(obvArr)),
     volumeSma20 : last(volSma20) == null ? null : Math.round(last(volSma20)),
-    // Outlier-robust 20-day volume reference — median of the last 20 sessions.
-    // Useful for swing trading where a single 10–20× spike day shouldn't skew
-    // the "typical" volume baseline.
+    // Outlier-robust 20-day volume references.
+    // volumeMedian20:        plain median of last 20 sessions (P50)
+    // volumeAvg20Trimmed:    winsorized mean — each value capped at 2 × median
+    //                        before averaging.  Resilient to single-day spikes
+    //                        like KRITINUT's 6.25-lakh outlier on 2026-04-20.
     volumeMedian20: (() => {
       if (volume.length < 20) return null;
       const window = volume.slice(-20).slice().sort((a, b) => a - b);
       return Math.round((window[9] + window[10]) / 2);
+    })(),
+    volumeAvg20Trimmed: (() => {
+      if (volume.length < 20) return null;
+      const window = volume.slice(-20);
+      const sorted = window.slice().sort((a, b) => a - b);
+      const median = (sorted[9] + sorted[10]) / 2;
+      const cap    = median * 2;
+      const capped = window.map(v => Math.min(v, cap));
+      const mean   = capped.reduce((s, v) => s + v, 0) / capped.length;
+      return Math.round(mean);
     })(),
     pivots
   };
@@ -1045,7 +1070,7 @@ module.exports = async function handler(req, res) {
     }
 
     // ── 2. Quote ──────────────────────────────────────────────────────────
-    let quote, usedExchange;
+    let quote, usedExchange, nseSurvData = null;
     if (isHistorical) {
       // Past date — reconstruct quote from historical OHLCV
       quote        = buildHistoricalQuote(historical, requestedDateStr);
@@ -1058,9 +1083,9 @@ module.exports = async function handler(req, res) {
         const quoteData = await getQuote(upperSymbol, exchange || detectedExchange);
         quote           = quoteData.quote;
         usedExchange    = quoteData.source;
+        nseSurvData     = quoteData.nseSurvData ?? null;
       } catch (e) {
         errors.quote = e.message;
-        // Graceful fallback: derive quote from latest historical row
         if (historical.length > 0) {
           quote        = buildHistoricalQuote(historical, requestedDateStr);
           usedExchange = detectedExchange;
@@ -1128,6 +1153,63 @@ module.exports = async function handler(req, res) {
     const chartPatterns                         = detectChartPatterns(historical);
     const signals                               = computeSignals(historical, indicators);
 
+    // ── 5a. Compute PE & PB from live data when both inputs are available ──
+    // Screener publishes ratios with a ~24-hr lag; computing from current ltp
+    // is always fresher.  We keep the Screener value as fallback and surface
+    // which source produced the published number via peSource / pbSource.
+    if (fundamentals && quote && typeof quote.ltp === 'number' && quote.ltp > 0) {
+      if (typeof fundamentals.epsTTM === 'number' && fundamentals.epsTTM > 0) {
+        fundamentals.pe       = parseFloat((quote.ltp / fundamentals.epsTTM).toFixed(2));
+        fundamentals.peSource = 'computed';
+      } else if (fundamentals.pe != null) {
+        fundamentals.peSource = 'screener';
+      } else {
+        fundamentals.peSource = null;
+      }
+      if (typeof fundamentals.bookValuePerShare === 'number' && fundamentals.bookValuePerShare > 0) {
+        fundamentals.pb       = parseFloat((quote.ltp / fundamentals.bookValuePerShare).toFixed(2));
+        fundamentals.pbSource = 'computed';
+      } else if (fundamentals.pb != null) {
+        fundamentals.pbSource = 'screener';
+      } else {
+        fundamentals.pbSource = null;
+      }
+    }
+
+    // ── 5b. Build comprehensive surveillance block from NSE quote data ─────
+    // Combines three signals:
+    //   1. Raw NSE surveillance.surv  (e.g. "ESM - I (34)")
+    //   2. NSE info.activeSeries / metadata.series  (BE/BZ ⇒ T2T)
+    //   3. Pre-existing ASM-list check from getSurveillance() above
+    let surveillanceBlock = surveillance || { asm: false, gsm: false, t2t: false, description: null };
+    {
+      const raw    = (nseSurvData?.rawNseString || '').toUpperCase();
+      const desc   = nseSurvData?.rawNseDesc || null;
+      const series = (nseSurvData?.metadataSeries || nseSurvData?.activeSeries?.[0] || '').toUpperCase();
+
+      const isASM = raw.includes('ASM') || surveillanceBlock.asm === true;
+      const isGSM = raw.includes('GSM') || surveillanceBlock.gsm === true;
+      const isESM = raw.includes('ESM');
+      const isT2T = raw.includes('T2T') || raw.includes('TRADE') || series === 'BE' || series === 'BZ';
+
+      // Human-readable description: prefer NSE's desc, then surv, then series-derived
+      let humanDesc = null;
+      if (desc)            humanDesc = desc;
+      else if (raw)        humanDesc = nseSurvData.rawNseString;
+      else if (isT2T)      humanDesc = `Trade-for-Trade (${series} Series)`;
+
+      surveillanceBlock = {
+        asm           : isASM,
+        gsm           : isGSM,
+        esm           : isESM,
+        t2t           : isT2T,
+        isASM, isGSM, isESM, isT2T,                // explicit aliases for kill-switch use
+        description   : humanDesc,
+        rawNseString  : nseSurvData?.rawNseString ?? null,
+        series        : nseSurvData?.metadataSeries ?? null
+      };
+    }
+
     // ── 6. Build response ─────────────────────────────────────────────────
     const responseData = {
       meta: {
@@ -1150,7 +1232,7 @@ module.exports = async function handler(req, res) {
       announcements,
       delivery: deliveryFinal,
       blockDeals,
-      surveillance,
+      surveillance: surveillanceBlock,
       fno,
       sector,
       errors: Object.keys(errors).length > 0 ? errors : null
