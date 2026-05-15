@@ -423,9 +423,11 @@ async function fetchExchangeHistorical(exchange, symbol, dates) {
       }
     });
   }
-  // Don't await writes — they happen in the background.  Response can
-  // return without waiting for cache fills (best-effort caching).
-  // If you want guaranteed cache fills, change to:  await Promise.all(writes);
+  // Await writes synchronously — Vercel kills the lambda right after the
+  // response is sent, so fire-and-forget writes get cancelled.  Adding
+  // ~200 ms to the cold path here saves a 16-s "still half-cold" call on
+  // every subsequent request.
+  if (writes.length > 0) await Promise.all(writes);
 
   // Attach stats to a process-wide debug log (helpful for verifying KV behavior)
   globalThis.__lastBhavCacheStats = { exchange, symbol: upper, window: dates.length, ...stats };
