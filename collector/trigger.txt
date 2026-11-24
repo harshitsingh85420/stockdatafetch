@@ -1,0 +1,1 @@
+Run global equity universe snapshot collector.
