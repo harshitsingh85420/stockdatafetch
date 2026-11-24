@@ -1,0 +1,32 @@
+name: Collect global equity universe
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "collector/trigger.txt"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Check out collector
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download and audit FinanceDatabase equities
+        run: python collector/collect_financedatabase_equities.py
+      - name: Upload snapshot artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: global-equity-universe-snapshot
+          path: dist/
+          if-no-files-found: error
+          retention-days: 90
