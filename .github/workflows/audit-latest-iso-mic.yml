@@ -1,0 +1,34 @@
+name: Refresh latest ISO MIC coverage audit
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "collector/source_mic_counts.csv"
+      - "collector/audit_latest_iso_mic_registry.py"
+      - "collector/mic_audit_trigger.txt"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  mic-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out audit inputs
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Download latest official ISO MIC registry and cross-check source MICs
+        run: python collector/audit_latest_iso_mic_registry.py
+      - name: Upload ISO MIC audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: latest-iso-mic-coverage-audit
+          path: dist_mic/
+          if-no-files-found: error
+          retention-days: 90
