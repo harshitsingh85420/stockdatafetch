@@ -1,1 +1,1 @@
-Refresh against latest official ISO 10383 MIC release.
+Refresh against latest official ISO 10383 MIC release. Triggered 2026-11-25 after workflow deployment.
